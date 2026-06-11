@@ -1,0 +1,90 @@
+# ============================================================
+# MANGLAR — .gitignore
+# ============================================================
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+*.egg
+
+# --- Jupyter / Colab ---
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*.ipynb_checkpoints
+
+# --- Data — NEVER commit raw or processed rasters ---
+data/raw/
+data/processed/
+data/external/*.tif
+data/external/*.shp
+data/external/*.dbf
+data/external/*.shx
+data/external/*.prj
+data/external/*.cpg
+
+# Keep zone boundary GeoJSONs (small, version-controlled)
+!data/external/zone1_boundary.geojson
+!data/external/zone2_boundary.geojson
+!data/external/zone3_boundary.geojson
+
+# --- Outputs — figures committed, large rasters not ---
+outputs/maps/*.tif
+outputs/maps/*.geotiff
+outputs/exports/
+# Keep small PNGs and PDFs for figures
+!outputs/figures/*.png
+!outputs/figures/*.pdf
+!outputs/tables/*.csv
+
+# --- Model checkpoints (large binaries) ---
+outputs/exports/checkpoints/
+*.pt
+*.pth
+*.ckpt
+# Exception: keep the pretrained Presto weights pointer file
+!src/models/presto/pretrained_weights_url.txt
+
+# --- Paper — keep drafts, exclude submission zips ---
+paper/submission/*.zip
+paper/submission/*.tar.gz
+
+# --- Environment and secrets ---
+.env
+*.env
+.env.local
+config/secrets.yaml
+configs/secrets.yaml
+ee_credentials/
+# GEE service account key — NEVER commit
+*service_account*.json
+*credentials*.json
+
+# --- OS and IDE ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Logs ---
+*.log
+logs/
+runs/
+
+# --- Temporary files ---
+tmp/
+temp/
+*.tmp

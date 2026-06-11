@@ -1,0 +1,42 @@
+# ============================================================
+# MANGLAR — gee_config.yaml
+# Google Earth Engine export parameters.
+# All exports go to Google Drive folder defined below.
+# ============================================================
+
+drive:
+  folder: "MANGLAR_GEE_EXPORTS"   # Must exist in your Google Drive
+
+exports:
+  sentinel2_composites:
+    description_prefix: "manglar_s2"
+    scale: 10
+    crs: "EPSG:4326"
+    file_format: "GeoTIFF"
+    max_pixels: 1e13
+
+  sentinel1_composites:
+    description_prefix: "manglar_s1"
+    scale: 10
+    crs: "EPSG:4326"
+    file_format: "GeoTIFF"
+    max_pixels: 1e13
+
+  gmw_mask:
+    description_prefix: "manglar_gmw_mask"
+    scale: 25
+    crs: "EPSG:4326"
+    file_format: "GeoTIFF"
+
+  mapbiomas:
+    description_prefix: "manglar_mapbiomas"
+    scale: 30
+    crs: "EPSG:4326"
+    file_format: "GeoTIFF"
+    collection: "projects/mapbiomas-workspace/public/collection8/mapbiomas_collection80_integration_v1"
+
+# GEE asset paths for data already ingested to GEE
+assets:
+  gmw_2020: "projects/mangrovescience/assets/GMW_2020_v3"
+  mapbiomas_col8: "projects/mapbiomas-workspace/public/collection8/mapbiomas_collection80_integration_v1"
+  gfw_effort: "projects/global-fishing-watch/datasets/fishing-effort/v3"

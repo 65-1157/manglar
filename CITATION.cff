@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the associated paper when published."
+title: "MANGLAR: Spatial co-occurrence of mangrove canopy degradation and coastal fishing pressure in the Reentrâncias Maranhenses"
+type: software
+license: MIT
+repository-code: "https://github.com/YOUR_USERNAME/manglar"
+keywords:
+  - mangrove
+  - remote sensing
+  - Sentinel-2
+  - Global Fishing Watch
+  - spatial regression
+  - deep learning
+  - Reentrâncias Maranhenses
+  - Brazil
+  - canopy degradation
+  - fishing pressure
+# authors: to be populated before repository goes public

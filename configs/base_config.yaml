@@ -1,0 +1,126 @@
+# ============================================================
+# MANGLAR — base_config.yaml
+# Single source of truth for all parameters.
+# Import this in every script via src/utils/config_loader.py
+# ============================================================
+
+project:
+  name: "MANGLAR"
+  version: "0.1.0"
+  random_seed: 42
+
+# ---- Study area boundaries (WGS84 lon/lat) ----------------
+zones:
+  zone1:
+    name: "Reentrâncias Maranhenses western block"
+    role: "primary"
+    bbox: [-46.0, -2.5, -44.0, -1.0]   # [west, south, east, north]
+    crs: "EPSG:4326"
+  zone2:
+    name: "Itapecuru River estuary"
+    role: "contrast"
+    bbox: [-44.2, -3.0, -43.6, -2.4]
+    crs: "EPSG:4326"
+  zone3:
+    name: "Baixada Maranhense"
+    role: "calibration"
+    bbox: [-45.5, -3.5, -44.5, -2.8]
+    crs: "EPSG:4326"
+
+# ---- Temporal coverage -------------------------------------
+time:
+  start_year: 2017           # First full Sentinel-2 year with consistent coverage
+  end_year: 2024
+  composite_period: "monthly"
+  cloud_mask_threshold: 0.2  # Maximum cloud fraction per pixel to include
+
+# ---- Sentinel-2 bands to export ----------------------------
+sentinel2:
+  bands: ["B2","B3","B4","B5","B6","B7","B8","B8A","B11","B12"]
+  resolution_m: 10
+  indices:
+    - name: "NDVI"
+      formula: "(B8 - B4) / (B8 + B4)"
+    - name: "EVI"
+      formula: "2.5 * (B8 - B4) / (B8 + 6*B4 - 7.5*B2 + 1)"
+    - name: "CIre"
+      formula: "(B7 / B5) - 1"
+    - name: "NDWI"
+      formula: "(B3 - B8) / (B3 + B8)"
+
+# ---- Sentinel-1 bands to export ----------------------------
+sentinel1:
+  bands: ["VV", "VH"]
+  resolution_m: 10
+  orbit_pass: "DESCENDING"
+
+# ---- GFW fishing effort ------------------------------------
+gfw:
+  buffer_km: 20              # Coastal buffer for effort overlay
+  annual_rasters: true
+  resolution_deg: 0.01       # Native GFW resolution (~1 km)
+
+# ---- STL decomposition baseline ----------------------------
+stl:
+  period: 12                 # Monthly seasonality
+  seasonal: 13               # Seasonal smoother window (must be odd)
+  trend: null                # null = auto-determined from period
+  robust: true               # Use robust fitting (handles outliers)
+
+# ---- N-BEATS model -----------------------------------------
+nbeats:
+  input_size: 36             # 3-year lookback window (months)
+  forecast_size: 12          # 1-year forecast horizon
+  stacks:
+    - type: "trend"
+      n_blocks: 3
+      n_layers: 4
+      hidden_size: 256
+      degree_of_polynomial: 3
+    - type: "seasonality"
+      n_blocks: 3
+      n_layers: 4
+      hidden_size: 256
+      num_harmonics: 6
+  training:
+    batch_size: 4096         # Pixels per batch — fits T4 VRAM comfortably
+    epochs: 100
+    learning_rate: 0.001
+    loss: "MAE"
+    early_stopping_patience: 10
+
+# ---- Presto model ------------------------------------------
+presto:
+  pretrained_checkpoint: "data/external/presto_default.pt"
+  finetune_on: "zone3"       # Use Zone 3 calibration pixels
+  output_dim: 1              # Scalar trend slope per pixel
+  regression: true
+  training:
+    batch_size: 2048
+    epochs: 50
+    learning_rate: 0.0001
+    freeze_encoder: false    # Fine-tune full encoder
+    fp16: true               # Mixed precision — halves VRAM
+
+# ---- Spatial regression ------------------------------------
+regression:
+  model: "spatial_lag"       # Options: "spatial_lag", "gwr", "ols"
+  dependent_variable: "canopy_trend_slope"
+  independent_variables:
+    - "gfw_mean_effort_log"
+    - "mapbiomas_urban_fraction"
+    - "osm_road_density_km_per_km2"
+    - "ana_discharge_anomaly"
+  spatial_weights: "queen"   # Spatial weights matrix type
+  significance_threshold: 0.05
+
+# ---- Output paths ------------------------------------------
+paths:
+  raw_data: "data/raw"
+  processed: "data/processed"
+  external: "data/external"
+  outputs: "outputs"
+  checkpoints: "outputs/exports/checkpoints"
+  figures: "outputs/figures"
+  maps: "outputs/maps"
+  tables: "outputs/tables"
