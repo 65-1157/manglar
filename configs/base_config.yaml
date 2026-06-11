@@ -8,6 +8,8 @@ project:
   name: "MANGLAR"
   version: "0.1.0"
   random_seed: 42
+  gee_project: "manglar-499119"        # add this
+  gee_drive_folder: "MANGLAR_GEE_EXPORTS"  # add this
 
 # ---- Study area boundaries (WGS84 lon/lat) ----------------
 zones:
