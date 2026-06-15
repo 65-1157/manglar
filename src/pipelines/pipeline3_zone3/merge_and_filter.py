@@ -1,23 +1,23 @@
 ﻿"""
 MANGLAR — src/pipelines/pipeline3_zone3/merge_and_filter.py
 
-Pipeline 3 - Zone 3 (calibration zone) ingestion.
+Pipeline 3 - Zone 3 (calibration zone) ingestion. (v5)
 
-ARCHITECTURE (v4):
-  Each year has 6 non-overlapping GEE export tiles, each containing
-  all 48 bands. Previous versions called rio_merge once PER BAND
-  (48 merges x 6 tiles = 288 reads/year), paying full merge/resample
-  setup cost 48x redundantly for the same underlying pixels.
+ARCHITECTURE:
+  v3 mosaicked all 48 bands at once (~17 GB/year) -> OOM.
+  v4 read each tile once, all bands, full tile in RAM (~2.85 GB/tile)
+     PLUS a local-disk copy step whose Drive-FUSE page cache pushed
+     total RAM past the limit before the read even started -> OOM.
 
-  This version reads each tile ONCE (all 48 bands in a single
-  src.read() call), computes that tile's integer pixel offset within
-  the global grid (tiles are axis-aligned, same resolution/CRS - pure
-  offset, no resampling needed), and uses numpy fancy indexing to
-  pull out the masked pixel values for all 48 bands at once.
-  Net: 6 reads/year instead of 288.
+  v5 removes the local-copy step entirely (it solved a latency problem
+  that benchmarking showed was NOT the bottleneck) and reads each tile
+  directly from Drive in small row-blocks (windowed reads). Memory per
+  block = block_rows x tile_width x n_bands x 4 bytes, independent of
+  total tile/grid size - bounded and predictable regardless of zone
+  size, which matters for Zone 1 later too.
 
-  Retains: local tile caching, per-year checkpoints (resumable),
-  and time.time() instrumentation at every milestone.
+  Retains: per-year checkpoints (resumable on crash) and time.time()
+  instrumentation at every milestone.
 
 USAGE IN COLAB:
     from google.colab import drive
@@ -32,7 +32,6 @@ USAGE IN COLAB:
         raw_dir       = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         external_dir  = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         processed_dir = '/content/drive/MyDrive/manglar_processed/zone3',
-        scratch_dir   = '/content/manglar_scratch',
     )
 
 If the runtime crashes/disconnects, re-run the same cell - completed
@@ -42,14 +41,15 @@ years are skipped automatically.
 import re
 import sys
 import glob
+import gc
 import time
-import shutil
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import rasterio
+from rasterio.windows import Window
 from rasterio.merge import merge as rio_merge
 from rasterio.warp import transform as rio_transform, reproject, Resampling
 
@@ -65,12 +65,18 @@ END_YEAR   = CFG["time"]["end_year"]
 INDICES    = ["NDVI", "EVI", "CIre", "NDWI"]
 NODATA_VAL = -9999.0
 
+# Row-block size for windowed reads. With n_bands=48 and a typical
+# tile width of ~5000 px, 200 rows x 5000 x 48 x 4 bytes ~= 192 MB
+# per block - safely bounded regardless of total grid size.
+BLOCK_ROWS = 200
+
 
 # ============================================================
 # Timing helper
 # ============================================================
 class Timer:
     """Tracks elapsed time since start and since the last milestone."""
+
     def __init__(self):
         self.t0 = time.time()
         self.last = self.t0
@@ -98,13 +104,14 @@ def find_tiles(folder, prefix):
     return [Path(t) for t in tiles]
 
 
-def mosaic_tiles(tiles, indexes=None):
-    """Used only for the cheap one-time reference-grid determination."""
+def mosaic_band1(tiles):
+    """Cheap one-time merge of band 1 only, used to determine the
+    reference grid geometry (transform, crs, shape).
+    """
     if not tiles:
-        raise FileNotFoundError("No tiles provided to mosaic_tiles().")
+        raise FileNotFoundError("No tiles provided to mosaic_band1().")
     srcs = [rasterio.open(t) for t in tiles]
-    kwargs = {"indexes": indexes} if indexes is not None else {}
-    mosaic, out_transform = rio_merge(srcs, **kwargs)
+    mosaic, out_transform = rio_merge(srcs, indexes=[1])
     crs = srcs[0].crs.to_string()
     for s in srcs:
         s.close()
@@ -138,7 +145,7 @@ def get_reference_grid(raw_dir, start_year):
     for s in srcs:
         s.close()
 
-    sample, out_transform, crs = mosaic_tiles(tiles, indexes=[1])
+    sample, out_transform, crs = mosaic_band1(tiles)
     shape = sample.shape[1:]  # (height, width)
     del sample
 
@@ -164,7 +171,7 @@ def build_mangrove_mask(external_dir, transform, crs, shape):
     else:
         print(f"  Found {len(mask_tiles)} GMW mask tile(s): "
               f"{[t.name for t in mask_tiles]}")
-        gmw_mosaic, gmw_transform, gmw_crs = mosaic_tiles(mask_tiles)
+        gmw_mosaic, gmw_transform, gmw_crs = mosaic_band1(mask_tiles)
         mask_data = np.zeros(shape, dtype=np.uint8)
         reproject(
             source=gmw_mosaic[0],
@@ -216,9 +223,9 @@ def tile_offset(tile_transform, ref_transform, tol=1e-6):
 
 
 # ============================================================
-# Per-year processing — one read per tile, all bands at once
+# Per-year processing — windowed reads directly from Drive
 # ============================================================
-def process_year(year, raw_dir, local_dir, ref_transform, ref_shape,
+def process_year(year, raw_dir, ref_transform, ref_shape,
                   n_bands, ref_band_names, rows, cols,
                   checkpoint_dir, timer):
     checkpoint_path = checkpoint_dir / f"zone3_{year}.parquet"
@@ -229,20 +236,9 @@ def process_year(year, raw_dir, local_dir, ref_transform, ref_shape,
 
     print(f"\nProcessing year {year}...")
 
-    drive_tiles = find_tiles(raw_dir, f"zone3_s2_{year}")
-    if not drive_tiles:
+    tiles = find_tiles(raw_dir, f"zone3_s2_{year}")
+    if not tiles:
         raise FileNotFoundError(f"No tiles found for year {year} in {raw_dir}.")
-
-    local_year_dir = local_dir / f"year_{year}"
-    local_year_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"  Copying {len(drive_tiles)} tile(s) to local disk...")
-    local_tiles = []
-    for t in drive_tiles:
-        dst = local_year_dir / t.name
-        shutil.copy2(t, dst)
-        local_tiles.append(dst)
-    timer.mark(f"year {year}: tile copy done")
 
     # Column names for this year, derived from the reference band
     # name pattern (index + month), with this year's number substituted.
@@ -256,15 +252,12 @@ def process_year(year, raw_dir, local_dir, ref_transform, ref_shape,
         col_names.append(f"{index}_{year}_{month:02d}")
 
     n_pixels = len(rows)
-    # Pre-allocate output: NaN until filled by whichever tile covers
-    # each pixel.
     year_data = {
         cn: np.full(n_pixels, np.nan, dtype=np.float32)
         for cn in col_names if cn is not None
     }
 
-    # ---- Read each tile ONCE, all bands, slice masked pixels ----
-    for tile_idx, tile_path in enumerate(local_tiles, start=1):
+    for tile_idx, tile_path in enumerate(tiles, start=1):
         with rasterio.open(tile_path) as src:
             if src.count != n_bands:
                 raise ValueError(
@@ -281,30 +274,49 @@ def process_year(year, raw_dir, local_dir, ref_transform, ref_shape,
                 (local_rows >= 0) & (local_rows < tile_h) &
                 (local_cols >= 0) & (local_cols < tile_w)
             )
-            n_in_tile = in_tile.sum()
+            n_in_tile = int(in_tile.sum())
             if n_in_tile == 0:
-                print(f"    Tile {tile_idx}/{len(local_tiles)} "
-                      f"({tile_path.name}): 0 mangrove pixels, skipping read.")
+                print(f"    Tile {tile_idx}/{len(tiles)} "
+                      f"({tile_path.name}): 0 mangrove pixels, skipping.")
                 continue
 
-            data = src.read().astype(np.float32)  # (n_bands, tile_h, tile_w)
+            global_idx = np.where(in_tile)[0]
+            lr = local_rows[in_tile]
+            lc = local_cols[in_tile]
 
-        data[data == NODATA_VAL] = np.nan
+            # ---- Read this tile in row-blocks (bounded memory) ----
+            n_blocks = (tile_h + BLOCK_ROWS - 1) // BLOCK_ROWS
+            for block_i, block_start in enumerate(range(0, tile_h, BLOCK_ROWS)):
+                block_h = min(BLOCK_ROWS, tile_h - block_start)
+                in_block = (lr >= block_start) & (lr < block_start + block_h)
+                if not in_block.any():
+                    continue
 
-        lr = local_rows[in_tile]
-        lc = local_cols[in_tile]
-        global_idx = np.where(in_tile)[0]
+                window = Window(col_off=0, row_off=block_start,
+                                 width=tile_w, height=block_h)
+                block_data = src.read(window=window).astype(np.float32)
+                block_data[block_data == NODATA_VAL] = np.nan
+                # shape: (n_bands, block_h, tile_w)
 
-        for band_idx in range(n_bands):
-            cn = col_names[band_idx]
-            if cn is None:
-                continue
-            values = data[band_idx, lr, lc]  # shape (n_in_tile,)
-            year_data[cn][global_idx] = values
+                block_lr = lr[in_block] - block_start
+                block_lc = lc[in_block]
+                block_global_idx = global_idx[in_block]
 
-        del data
-        timer.mark(f"year {year}: tile {tile_idx}/{len(local_tiles)} "
-                   f"({n_in_tile:,} px) processed")
+                for band_idx in range(n_bands):
+                    cn = col_names[band_idx]
+                    if cn is None:
+                        continue
+                    year_data[cn][block_global_idx] = \
+                        block_data[band_idx, block_lr, block_lc]
+
+                del block_data
+                gc.collect()
+
+            print(f"    Tile {tile_idx}/{len(tiles)} "
+                  f"({tile_path.name}): {n_in_tile:,} px, "
+                  f"{n_blocks} row-blocks done")
+
+        timer.mark(f"year {year}: tile {tile_idx}/{len(tiles)} done")
 
     df_year = pd.DataFrame(year_data)
     df_year.insert(0, "pixel_id", np.arange(n_pixels))
@@ -312,13 +324,16 @@ def process_year(year, raw_dir, local_dir, ref_transform, ref_shape,
     timer.mark(f"year {year}: checkpoint saved "
                f"({checkpoint_path.stat().st_size/1e6:.1f} MB)")
 
-    shutil.rmtree(local_year_dir, ignore_errors=True)
+    del year_data, df_year
+    gc.collect()
 
 
 # ============================================================
 # Entry point
 # ============================================================
 def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
+    """scratch_dir is accepted for backward compatibility with earlier
+    call sites but is no longer used (no local tile copy in v5)."""
     timer = Timer()
 
     raw_dir = Path(raw_dir)
@@ -326,25 +341,21 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
     processed_dir = Path(processed_dir) if processed_dir else (
         REPO_ROOT / "data" / "processed" / "zone3"
     )
-    scratch_dir = Path(scratch_dir) if scratch_dir else (
-        REPO_ROOT / ".scratch" / "zone3"
-    )
     processed_dir.mkdir(parents=True, exist_ok=True)
-    scratch_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoint_dir = processed_dir / "year_checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("MANGLAR - Pipeline 3 (Zone 3) - Merge and Filter")
-    print("(v4: one read per tile, all bands, offset-based indexing)")
+    print("(v5: windowed reads direct from Drive, bounded memory)")
     print("=" * 60)
     print(f"Years: {START_YEAR}-{END_YEAR}")
     print(f"Raw export dir: {raw_dir}")
     print(f"GMW mask dir:   {external_dir}")
     print(f"Output dir:     {processed_dir}")
     print(f"Checkpoints:    {checkpoint_dir}")
-    print(f"Local scratch:  {scratch_dir}")
+    print(f"Block size:     {BLOCK_ROWS} rows/read")
 
     print("\nDetermining reference grid from first year...")
     ref_transform, ref_crs, ref_shape, n_bands, ref_band_names = \
@@ -372,7 +383,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
 
     # ---- Process each year ----
     for year in range(START_YEAR, END_YEAR + 1):
-        process_year(year, raw_dir, scratch_dir, ref_transform, ref_shape,
+        process_year(year, raw_dir, ref_transform, ref_shape,
                       n_bands, ref_band_names, rows, cols,
                       checkpoint_dir, timer)
 
@@ -409,6 +420,8 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
             writer = pq.ParquetWriter(final_path, table.schema)
         writer.write_table(table)
         print(f"  Merged rows {start:,}-{end:,}")
+        del chunk, table
+        gc.collect()
 
     if writer is not None:
         writer.close()
@@ -432,5 +445,4 @@ if __name__ == "__main__":
         raw_dir=REPO_ROOT / "data" / "raw" / "gee_exports",
         external_dir=REPO_ROOT / "data" / "external",
         processed_dir=REPO_ROOT / "data" / "processed" / "zone3",
-        scratch_dir=REPO_ROOT / ".scratch" / "zone3",
     )
