@@ -1,49 +1,31 @@
 ﻿"""
 MANGLAR — src/pipelines/pipeline3_zone3/merge_and_filter.py
 
-Pipeline 3 — Zone 3 (calibration zone) ingestion.
-
-Reads raw GEE exports directly from a Google Drive folder (no local
-download needed), mosaics tiles, applies the GMW mangrove mask, and
-writes a per-pixel monthly time series table back to Drive.
-
-  1. MOSAIC   - stitches multiple GEE export tiles per year into one
-                continuous multi-band raster (in memory).
-
-  2. MASK     - applies the GMW mangrove extent mask (found by pattern,
-                handles single or multi-tile mask exports). If absent,
-                proceeds without masking and warns.
-
-  3. RESHAPE  - converts 8 yearly multi-band rasters (96 months x 4
-                indices) into a single pixel x time table. NoData
-                (-9999) -> NaN.
+Pipeline 3 - Zone 3 (calibration zone) ingestion.
+Memory-efficient version: processes one band at a time to avoid
+loading full 48-band x full-grid arrays into RAM.
 
 Output (written to processed_dir):
   zone3_pixel_timeseries.parquet
   zone3_pixel_timeseries.npz
 
----------------------------------------------------------------------
-USAGE IN GOOGLE COLAB
----------------------------------------------------------------------
+USAGE IN COLAB:
     from google.colab import drive
     drive.mount('/content/drive')
 
     import sys
-    sys.path.insert(0, '/content/drive/MyDrive/manglar')  # repo clone
+    sys.path.insert(0, '/content/drive/MyDrive/manglar')
 
     from src.pipelines.pipeline3_zone3.merge_and_filter import run
 
-    run(
+    df = run(
         raw_dir       = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         external_dir  = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         processed_dir = '/content/drive/MyDrive/manglar_processed/zone3',
     )
 
----------------------------------------------------------------------
-USAGE LOCALLY (defaults to repo's data/ structure)
----------------------------------------------------------------------
+USAGE LOCALLY:
     python src/pipelines/pipeline3_zone3/merge_and_filter.py
----------------------------------------------------------------------
 """
 
 import re
@@ -56,9 +38,9 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.merge import merge as rio_merge
-from rasterio.warp import transform as rio_transform
+from rasterio.warp import transform as rio_transform, reproject, Resampling
 
-# ---- Repo paths (for local defaults and config) -------------------
+# ---- Repo paths -----------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -73,64 +55,107 @@ NODATA_VAL = -9999.0
 
 
 # ============================================================
-# 1. MOSAIC - stitch GEE export tiles for one year
+# Tile discovery and mosaicking
 # ============================================================
-def find_tiles(raw_dir: Path, prefix: str) -> list[Path]:
+def find_tiles(raw_dir, prefix):
     """Find all GEE export tiles matching a prefix.
 
     GEE splits large exports into tiles named like:
         zone3_s2_2018-0000000000-0000000000.tif
         zone3_s2_2018-0000000000-0000004864.tif
-        ...
     A single (untiled) export is matched as 'prefix.tif'.
     """
+    raw_dir = Path(raw_dir)
     tiles = sorted(glob.glob(str(raw_dir / f"{prefix}-*.tif")))
-
     if not tiles:
         single = raw_dir / f"{prefix}.tif"
         if single.exists():
             tiles = [str(single)]
-
     return [Path(t) for t in tiles]
 
 
-def mosaic_tiles(tiles: list[Path]):
+def mosaic_tiles(tiles, indexes=None):
     """Mosaic a list of tile paths into one array.
+
+    Args:
+        tiles:   list of Path objects
+        indexes: optional list of band indexes (1-based) to mosaic.
+                 If None, mosaics ALL bands (memory-heavy — avoid for
+                 multi-band yearly stacks).
 
     Returns:
         data       - array of shape (bands, height, width)
         transform  - rasterio Affine transform of the mosaic
         crs        - CRS string
-        band_names - list of band descriptions
     """
     if not tiles:
         raise FileNotFoundError("No tiles provided to mosaic_tiles().")
 
     srcs = [rasterio.open(t) for t in tiles]
-    mosaic, out_transform = rio_merge(srcs)
+    if indexes is not None:
+        mosaic, out_transform = rio_merge(srcs, indexes=indexes)
+    else:
+        mosaic, out_transform = rio_merge(srcs)
     crs = srcs[0].crs.to_string()
-    band_names = [srcs[0].descriptions[i] or f"band_{i+1}"
-                   for i in range(srcs[0].count)]
 
     for s in srcs:
         s.close()
 
-    return mosaic, out_transform, crs, band_names
+    return mosaic, out_transform, crs
 
 
 # ============================================================
-# 2. MASK - apply GMW mangrove extent mask
+# Band name parsing
 # ============================================================
-def load_gmw_mask(external_dir: Path, transform, crs: str, shape):
-    """Find, mosaic (if needed), and reproject the GMW mask to match
-    the Sentinel-2 mosaic grid.
+def parse_band_name(name):
+    """Parse a band name like 'NDVI_2018_07' -> ('NDVI', 2018, 7)."""
+    m = re.match(r"(NDVI|EVI|CIre|NDWI)_(\d{4})_(\d{2})", name)
+    if not m:
+        return None
+    index, year, month = m.groups()
+    return index, int(year), int(month)
 
-    Searches for files matching 'zone3_gmw_mask*.tif' (handles single
-    or multi-tile exports, same naming convention as the S2 exports).
 
-    Returns a boolean array of shape (height, width) where True = mangrove.
-    Returns None if no matching file is found (mask skipped).
+# ============================================================
+# Reference grid (geometry only, cheap)
+# ============================================================
+def get_reference_grid(raw_dir, start_year):
+    """Determine the mosaic grid (transform, crs, shape, band layout)
+    from the first year's tiles, mosaicking only band 1 to avoid
+    loading the full 48-band stack into memory.
     """
+    tiles = find_tiles(raw_dir, f"zone3_s2_{start_year}")
+    if not tiles:
+        raise FileNotFoundError(
+            f"No tiles found for reference year {start_year} in {raw_dir}. "
+            f"Expected files matching 'zone3_s2_{start_year}-*.tif'."
+        )
+
+    srcs = [rasterio.open(t) for t in tiles]
+    n_bands = srcs[0].count
+    band_names = [srcs[0].descriptions[i] or f"band_{i+1}"
+                   for i in range(n_bands)]
+    for s in srcs:
+        s.close()
+
+    sample, out_transform, crs = mosaic_tiles(tiles, indexes=[1])
+    shape = sample.shape[1:]  # (height, width)
+    del sample
+
+    return out_transform, crs, shape, n_bands, band_names
+
+
+# ============================================================
+# Mangrove mask
+# ============================================================
+def build_mangrove_mask(external_dir, transform, crs, shape):
+    """Build the boolean mangrove mask on the reference grid.
+
+    Returns:
+        mask: bool array (height, width)
+        rows, cols: flat pixel indices where mask is True
+    """
+    external_dir = Path(external_dir)
     mask_tiles = find_tiles(external_dir, "zone3_gmw_mask")
     if not mask_tiles:
         mask_tiles = [Path(p) for p in
@@ -140,137 +165,147 @@ def load_gmw_mask(external_dir: Path, transform, crs: str, shape):
         warnings.warn(
             f"No GMW mask files found in {external_dir} "
             f"(expected 'zone3_gmw_mask*.tif'). "
-            f"Proceeding WITHOUT mangrove masking - all pixels retained."
+            f"Proceeding WITHOUT masking — ALL pixels retained. "
+            f"This may exceed memory for large grids."
         )
-        return None
+        mask = np.ones(shape, dtype=bool)
+    else:
+        print(f"  Found {len(mask_tiles)} GMW mask tile(s): "
+              f"{[t.name for t in mask_tiles]}")
+        gmw_mosaic, gmw_transform, gmw_crs = mosaic_tiles(mask_tiles)
 
-    print(f"  Found {len(mask_tiles)} GMW mask tile(s): "
-          f"{[t.name for t in mask_tiles]}")
+        mask_data = np.zeros(shape, dtype=np.uint8)
+        reproject(
+            source=gmw_mosaic[0],
+            destination=mask_data,
+            src_transform=gmw_transform,
+            src_crs=gmw_crs,
+            dst_transform=transform,
+            dst_crs=crs,
+            resampling=Resampling.nearest,
+        )
+        mask = mask_data > 0
+        del gmw_mosaic, mask_data
 
-    gmw_mosaic, gmw_transform, gmw_crs, _ = mosaic_tiles(mask_tiles)
+    rows, cols = np.where(mask)
+    n_pixels = len(rows)
+    print(f"  Mangrove pixels: {n_pixels:,} of {mask.size:,} "
+          f"({100 * n_pixels / mask.size:.2f}%)")
 
-    from rasterio.warp import reproject, Resampling
+    if n_pixels > 5_000_000:
+        warnings.warn(
+            f"{n_pixels:,} pixels retained — output table will have "
+            f"{n_pixels:,} rows x ~387 columns. Check available memory "
+            f"for the final DataFrame/parquet write."
+        )
+    if n_pixels == 0:
+        raise ValueError(
+            "Mangrove mask matched ZERO pixels. Check that the GMW mask "
+            "export covers the same area/CRS as the Sentinel-2 exports."
+        )
 
-    mask_data = np.zeros(shape, dtype=np.uint8)
-    reproject(
-        source=gmw_mosaic[0],
-        destination=mask_data,
-        src_transform=gmw_transform,
-        src_crs=gmw_crs,
-        dst_transform=transform,
-        dst_crs=crs,
-        resampling=Resampling.nearest,
+    return mask, rows, cols
+
+
+# ============================================================
+# Main extraction — band-by-band, memory efficient
+# ============================================================
+def build_pixel_timeseries(raw_dir, external_dir):
+    """Build the pixel x time series table, processing one band
+    at a time to keep peak memory low.
+    """
+    raw_dir = Path(raw_dir)
+    external_dir = Path(external_dir)
+
+    print("Determining reference grid from first year...")
+    ref_transform, ref_crs, ref_shape, n_bands, _ = \
+        get_reference_grid(raw_dir, START_YEAR)
+    print(f"  Grid shape: {ref_shape}, bands per year: {n_bands}")
+
+    print("\nBuilding mangrove mask...")
+    mask, rows, cols = build_mangrove_mask(
+        external_dir, ref_transform, ref_crs, ref_shape
     )
+    n_pixels = len(rows)
+    del mask  # only rows/cols needed from here on
 
-    mask = mask_data > 0
-    n_mangrove = mask.sum()
-    print(f"  GMW mask applied - {n_mangrove:,} mangrove pixels "
-          f"of {mask.size:,} total ({100*n_mangrove/mask.size:.1f}%)")
-    return mask
+    print("\nComputing pixel coordinates...")
+    xs, ys = rasterio.transform.xy(ref_transform, rows, cols)
+    lons, lats = np.array(xs), np.array(ys)
+    if ref_crs != "EPSG:4326":
+        lons, lats = rio_transform(ref_crs, "EPSG:4326", lons, lats)
+        lons, lats = np.array(lons), np.array(lats)
 
-
-# ============================================================
-# 3. RESHAPE - build per-pixel monthly time series table
-# ============================================================
-def parse_band_name(name: str):
-    """Parse a band name like 'NDVI_2018_07' -> ('NDVI', 2018, 7)."""
-    m = re.match(r"(NDVI|EVI|CIre|NDWI)_(\d{4})_(\d{2})", name)
-    if not m:
-        return None
-    index, year, month = m.groups()
-    return index, int(year), int(month)
-
-
-def build_pixel_timeseries(raw_dir: Path, external_dir: Path) -> pd.DataFrame:
-    """Mosaic all years, apply mask, and build the pixel x time table."""
-
-    all_band_data = {}   # (index, year, month) -> 2D array
-    ref_transform = None
-    ref_crs = None
-    ref_shape = None
+    data = {"pixel_id": np.arange(n_pixels), "lon": lons, "lat": lats}
 
     for year in range(START_YEAR, END_YEAR + 1):
         print(f"\nProcessing year {year}...")
         tiles = find_tiles(raw_dir, f"zone3_s2_{year}")
         if not tiles:
             raise FileNotFoundError(
-                f"No GEE export tiles found for year {year} in {raw_dir}. "
-                f"Expected files matching 'zone3_s2_{year}-*.tif' "
-                f"or 'zone3_s2_{year}.tif'."
+                f"No tiles found for year {year} in {raw_dir}. "
+                f"Expected files matching 'zone3_s2_{year}-*.tif'."
             )
-        print(f"  Found {len(tiles)} tile(s): {[t.name for t in tiles]}")
 
-        mosaic, transform, crs, band_names = mosaic_tiles(tiles)
-        print(f"  Mosaic shape: {mosaic.shape}")
+        srcs = [rasterio.open(t) for t in tiles]
+        band_names = [srcs[0].descriptions[i] or f"band_{i+1}"
+                       for i in range(srcs[0].count)]
+        year_n_bands = srcs[0].count
+        for s in srcs:
+            s.close()
 
-        if ref_transform is None:
-            ref_transform = transform
-            ref_crs = crs
-            ref_shape = mosaic.shape[1:]
-        elif mosaic.shape[1:] != ref_shape:
+        if year_n_bands != n_bands:
             raise ValueError(
-                f"Year {year} mosaic shape {mosaic.shape[1:]} does not "
-                f"match reference shape {ref_shape}. Years must share "
-                f"the same export grid - re-export with identical bbox/scale."
+                f"Year {year} has {year_n_bands} bands, "
+                f"expected {n_bands} (from {START_YEAR}). "
+                f"Years must share the same export structure."
             )
 
-        for i, name in enumerate(band_names):
+        for band_idx in range(1, n_bands + 1):
+            name = band_names[band_idx - 1]
             parsed = parse_band_name(name)
             if parsed is None:
-                warnings.warn(f"Could not parse band name '{name}' - skipping")
+                warnings.warn(f"Could not parse band '{name}' in year "
+                               f"{year} — skipping")
                 continue
             index, b_year, b_month = parsed
-            band = mosaic[i].astype(np.float32)
-            band[band == NODATA_VAL] = np.nan
-            all_band_data[(index, b_year, b_month)] = band
 
-    # ---- Apply GMW mask ----
-    mask = load_gmw_mask(external_dir, ref_transform, ref_crs, ref_shape)
-    if mask is None:
-        mask = np.ones(ref_shape, dtype=bool)
+            band_mosaic, _, _ = mosaic_tiles(tiles, indexes=[band_idx])
+            band_arr = band_mosaic[0].astype(np.float32)
+            del band_mosaic
 
-    rows, cols = np.where(mask)
-    n_pixels = len(rows)
-    print(f"\nTotal pixels retained: {n_pixels:,}")
+            if band_arr.shape != ref_shape:
+                raise ValueError(
+                    f"Year {year} band {band_idx} ('{name}') shape "
+                    f"{band_arr.shape} != reference shape {ref_shape}. "
+                    f"Re-export with identical bbox/scale across years."
+                )
 
-    # ---- Compute lon/lat for each retained pixel ----
-    xs, ys = rasterio.transform.xy(ref_transform, rows, cols)
-    lons, lats = np.array(xs), np.array(ys)
+            band_arr[band_arr == NODATA_VAL] = np.nan
 
-    if ref_crs != "EPSG:4326":
-        lons, lats = rio_transform(ref_crs, "EPSG:4326", lons, lats)
-        lons, lats = np.array(lons), np.array(lats)
+            col_name = f"{index}_{b_year}_{b_month:02d}"
+            data[col_name] = band_arr[rows, cols]
+            del band_arr
 
-    # ---- Assemble table ----
-    data = {"pixel_id": np.arange(n_pixels), "lon": lons, "lat": lats}
-
-    for year in range(START_YEAR, END_YEAR + 1):
-        for month in range(1, 13):
-            for index in INDICES:
-                key = (index, year, month)
-                col_name = f"{index}_{year}_{month:02d}"
-                if key in all_band_data:
-                    data[col_name] = all_band_data[key][rows, cols]
-                else:
-                    warnings.warn(f"Missing band {col_name} - filled with NaN")
-                    data[col_name] = np.full(n_pixels, np.nan, dtype=np.float32)
+            if band_idx % 12 == 0:
+                print(f"    ...{band_idx}/{n_bands} bands done "
+                      f"(through {index}_{b_year}_{b_month:02d})")
 
     df = pd.DataFrame(data)
     return df
 
 
 # ============================================================
-# Main entry point
+# Entry point
 # ============================================================
 def run(raw_dir, external_dir=None, processed_dir=None):
     """Run the full Zone 3 merge-and-filter pipeline.
 
     Args:
-        raw_dir:       Folder containing 'zone3_s2_YYYY-*.tif' tiles
-                        (e.g. your Drive MANGLAR_GEE_EXPORTS folder).
+        raw_dir:       Folder containing 'zone3_s2_YYYY-*.tif' tiles.
         external_dir:  Folder containing 'zone3_gmw_mask*.tif'.
-                        Defaults to raw_dir if not given.
-        processed_dir: Output folder for the parquet/npz results.
+                        Defaults to raw_dir.
+        processed_dir: Output folder for parquet/npz.
                         Defaults to REPO_ROOT/data/processed/zone3.
 
     Returns:
@@ -285,6 +320,7 @@ def run(raw_dir, external_dir=None, processed_dir=None):
 
     print("=" * 60)
     print("MANGLAR - Pipeline 3 (Zone 3) - Merge and Filter")
+    print("(memory-efficient, band-by-band)")
     print("=" * 60)
     print(f"Years: {START_YEAR}-{END_YEAR}")
     print(f"Raw export dir: {raw_dir}")
@@ -311,8 +347,8 @@ def run(raw_dir, external_dir=None, processed_dir=None):
     )
     print(f"Saved: {npz_path} ({npz_path.stat().st_size / 1e6:.1f} MB)")
 
-    print("\nDone. Output columns:")
-    print(f"  Metadata: {meta_cols}")
+    print("\nDone. Output summary:")
+    print(f"  Metadata columns: {meta_cols}")
     print(f"  Time series columns: {len(ts_cols)} "
           f"({len(INDICES)} indices x {END_YEAR - START_YEAR + 1} years x 12 months)")
     print(f"  Total rows (mangrove pixels): {len(df):,}")
