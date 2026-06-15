@@ -2,15 +2,17 @@
 MANGLAR — src/pipelines/pipeline3_zone3/merge_and_filter.py
 
 Pipeline 3 - Zone 3 (calibration zone) ingestion.
-Optimized version:
-  - Each year's GEE tiles are copied from Drive to LOCAL disk ONCE,
-    then all 48 bands are mosaicked from local copies (avoids
-    hundreds of slow Drive-mounted file opens).
-  - Each year's result is checkpointed as a small parquet on Drive
-    immediately after processing. On restart, completed years are
-    skipped automatically.
-  - Final step merges all yearly parquets (on pixel_id) into the
-    single zone3_pixel_timeseries.parquet.
+
+KEY OPTIMIZATION: all rio_merge calls are cropped to the bounding
+box of the mangrove mask, not the full export grid. Since mangrove
+covers ~15% of the area but is spatially clustered, this can cut
+per-band merge cost roughly in proportion to the bbox area reduction.
+
+Also includes:
+  - Local tile caching per year (kept, small fixed benefit)
+  - Per-year checkpoints to Drive (resumable on crash)
+  - time.time() instrumentation at every milestone, printing both
+    elapsed-since-start and elapsed-since-last-milestone
 
 USAGE IN COLAB:
     from google.colab import drive
@@ -28,13 +30,14 @@ USAGE IN COLAB:
         scratch_dir   = '/content/manglar_scratch',
     )
 
-If the runtime crashes/disconnects, just re-run the same cell after
-reconnecting — completed years are skipped automatically.
+If the runtime crashes/disconnects, re-run the same cell - completed
+years are skipped automatically.
 """
 
 import re
 import sys
 import glob
+import time
 import shutil
 import warnings
 from pathlib import Path
@@ -59,6 +62,25 @@ NODATA_VAL = -9999.0
 
 
 # ============================================================
+# Timing helper
+# ============================================================
+class Timer:
+    """Tracks elapsed time since start and since the last milestone."""
+    def __init__(self):
+        self.t0 = time.time()
+        self.last = self.t0
+
+    def mark(self, label):
+        now = time.time()
+        since_last = now - self.last
+        since_start = now - self.t0
+        print(f"  [{label}] "
+              f"+{since_last:6.1f}s since last  |  "
+              f"{since_start/60:6.1f} min total elapsed")
+        self.last = now
+
+
+# ============================================================
 # Tile discovery and mosaicking
 # ============================================================
 def find_tiles(folder, prefix):
@@ -71,14 +93,19 @@ def find_tiles(folder, prefix):
     return [Path(t) for t in tiles]
 
 
-def mosaic_tiles(tiles, indexes=None):
+def mosaic_tiles(tiles, indexes=None, bounds=None):
+    """Mosaic tiles, optionally cropped to a (left, bottom, right, top)
+    bounds tuple in the tiles' CRS.
+    """
     if not tiles:
         raise FileNotFoundError("No tiles provided to mosaic_tiles().")
     srcs = [rasterio.open(t) for t in tiles]
+    kwargs = {}
     if indexes is not None:
-        mosaic, out_transform = rio_merge(srcs, indexes=indexes)
-    else:
-        mosaic, out_transform = rio_merge(srcs)
+        kwargs["indexes"] = indexes
+    if bounds is not None:
+        kwargs["bounds"] = bounds
+    mosaic, out_transform = rio_merge(srcs, **kwargs)
     crs = srcs[0].crs.to_string()
     for s in srcs:
         s.close()
@@ -94,7 +121,7 @@ def parse_band_name(name):
 
 
 # ============================================================
-# Reference grid (geometry only, cheap)
+# Reference grid (geometry only, cheap — band 1 only)
 # ============================================================
 def get_reference_grid(raw_dir, start_year):
     tiles = find_tiles(raw_dir, f"zone3_s2_{start_year}")
@@ -115,7 +142,7 @@ def get_reference_grid(raw_dir, start_year):
 
 
 # ============================================================
-# Mangrove mask
+# Mangrove mask + bounding box
 # ============================================================
 def build_mangrove_mask(external_dir, transform, crs, shape):
     external_dir = Path(external_dir)
@@ -155,32 +182,57 @@ def build_mangrove_mask(external_dir, transform, crs, shape):
     if n_pixels == 0:
         raise ValueError("Mangrove mask matched ZERO pixels.")
 
-    return mask, rows, cols
+    # ---- Bounding box of mangrove pixels, in pixel coords ----
+    row_min, row_max = rows.min(), rows.max()
+    col_min, col_max = cols.min(), cols.max()
+
+    bbox_h = row_max - row_min + 1
+    bbox_w = col_max - col_min + 1
+    full_h, full_w = shape
+    area_frac = (bbox_h * bbox_w) / (full_h * full_w)
+    print(f"  Mangrove bbox (pixels): rows [{row_min}:{row_max}], "
+          f"cols [{col_min}:{col_max}]")
+    print(f"  Bbox area: {bbox_h}x{bbox_w} = "
+          f"{100*area_frac:.1f}% of full grid "
+          f"({full_h}x{full_w})")
+
+    # Convert pixel bbox -> geographic bounds (left, bottom, right, top)
+    # Add a small buffer (2 px) to avoid edge-clipping issues
+    buf = 2
+    row_min_b = max(row_min - buf, 0)
+    row_max_b = min(row_max + buf, full_h - 1)
+    col_min_b = max(col_min - buf, 0)
+    col_max_b = min(col_max + buf, full_w - 1)
+
+    left, top = transform * (col_min_b, row_min_b)
+    right, bottom = transform * (col_max_b + 1, row_max_b + 1)
+    geo_bounds = (left, bottom, right, top)
+    print(f"  Geo bounds for cropped merges: {geo_bounds}")
+
+    # Re-derive rows/cols relative to the CROPPED grid (origin shifted)
+    rows_local = rows - row_min_b
+    cols_local = cols - col_min_b
+    cropped_shape = (row_max_b - row_min_b + 1, col_max_b - col_min_b + 1)
+
+    return rows_local, cols_local, geo_bounds, cropped_shape
 
 
 # ============================================================
-# Per-year processing — local tile copy, then band-by-band
+# Per-year processing — local tile cache, cropped merges
 # ============================================================
-def process_year(year, raw_dir, local_dir, ref_shape, n_bands,
-                  rows, cols, checkpoint_dir):
-    """Copy this year's tiles to local disk, mosaic each band,
-    extract masked values, save year checkpoint parquet to Drive.
-
-    Skips entirely if the checkpoint already exists (resume support).
-    """
+def process_year(year, raw_dir, local_dir, cropped_shape, n_bands,
+                  rows, cols, geo_bounds, checkpoint_dir, timer):
     checkpoint_path = checkpoint_dir / f"zone3_{year}.parquet"
     if checkpoint_path.exists():
         print(f"  Year {year}: checkpoint already exists, skipping.")
+        timer.mark(f"year {year} (skipped)")
         return
 
     print(f"\nProcessing year {year}...")
 
-    # ---- Copy this year's tiles to local disk ----
     drive_tiles = find_tiles(raw_dir, f"zone3_s2_{year}")
     if not drive_tiles:
-        raise FileNotFoundError(
-            f"No tiles found for year {year} in {raw_dir}."
-        )
+        raise FileNotFoundError(f"No tiles found for year {year} in {raw_dir}.")
 
     local_year_dir = local_dir / f"year_{year}"
     local_year_dir.mkdir(parents=True, exist_ok=True)
@@ -191,9 +243,8 @@ def process_year(year, raw_dir, local_dir, ref_shape, n_bands,
         dst = local_year_dir / t.name
         shutil.copy2(t, dst)
         local_tiles.append(dst)
-    print(f"  Copy done.")
+    timer.mark(f"year {year}: tile copy done")
 
-    # ---- Get band names from local copy ----
     srcs = [rasterio.open(t) for t in local_tiles]
     band_names = [srcs[0].descriptions[i] or f"band_{i+1}"
                    for i in range(srcs[0].count)]
@@ -202,11 +253,8 @@ def process_year(year, raw_dir, local_dir, ref_shape, n_bands,
         s.close()
 
     if year_n_bands != n_bands:
-        raise ValueError(
-            f"Year {year} has {year_n_bands} bands, expected {n_bands}."
-        )
+        raise ValueError(f"Year {year} has {year_n_bands} bands, expected {n_bands}.")
 
-    # ---- Process each band from LOCAL tiles ----
     year_data = {}
     for band_idx in range(1, n_bands + 1):
         name = band_names[band_idx - 1]
@@ -216,14 +264,15 @@ def process_year(year, raw_dir, local_dir, ref_shape, n_bands,
             continue
         index, b_year, b_month = parsed
 
-        band_mosaic, _, _ = mosaic_tiles(local_tiles, indexes=[band_idx])
+        band_mosaic, _, _ = mosaic_tiles(local_tiles, indexes=[band_idx],
+                                          bounds=geo_bounds)
         band_arr = band_mosaic[0].astype(np.float32)
         del band_mosaic
 
-        if band_arr.shape != ref_shape:
+        if band_arr.shape != cropped_shape:
             raise ValueError(
-                f"Year {year} band {band_idx} shape {band_arr.shape} "
-                f"!= reference shape {ref_shape}."
+                f"Year {year} band {band_idx} cropped shape "
+                f"{band_arr.shape} != expected {cropped_shape}."
             )
 
         band_arr[band_arr == NODATA_VAL] = np.nan
@@ -232,17 +281,15 @@ def process_year(year, raw_dir, local_dir, ref_shape, n_bands,
         del band_arr
 
         if band_idx % 12 == 0:
-            print(f"    ...{band_idx}/{n_bands} bands done "
-                  f"(through {col_name})")
+            timer.mark(f"year {year}: {band_idx}/{n_bands} bands "
+                       f"(through {col_name})")
 
-    # ---- Save year checkpoint to Drive ----
     df_year = pd.DataFrame(year_data)
     df_year.insert(0, "pixel_id", np.arange(len(df_year)))
     df_year.to_parquet(checkpoint_path, index=False)
-    print(f"  Checkpoint saved: {checkpoint_path.name} "
-          f"({checkpoint_path.stat().st_size / 1e6:.1f} MB)")
+    timer.mark(f"year {year}: checkpoint saved "
+               f"({checkpoint_path.stat().st_size/1e6:.1f} MB)")
 
-    # ---- Clean up local copies for this year ----
     shutil.rmtree(local_year_dir, ignore_errors=True)
 
 
@@ -250,6 +297,8 @@ def process_year(year, raw_dir, local_dir, ref_shape, n_bands,
 # Entry point
 # ============================================================
 def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
+    timer = Timer()
+
     raw_dir = Path(raw_dir)
     external_dir = Path(external_dir) if external_dir else raw_dir
     processed_dir = Path(processed_dir) if processed_dir else (
@@ -266,7 +315,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
 
     print("=" * 60)
     print("MANGLAR - Pipeline 3 (Zone 3) - Merge and Filter")
-    print("(local tile cache + per-year checkpoints, resumable)")
+    print("(bbox-cropped merges + local cache + checkpoints + timing)")
     print("=" * 60)
     print(f"Years: {START_YEAR}-{END_YEAR}")
     print(f"Raw export dir: {raw_dir}")
@@ -279,33 +328,42 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
     ref_transform, ref_crs, ref_shape, n_bands, _ = \
         get_reference_grid(raw_dir, START_YEAR)
     print(f"  Grid shape: {ref_shape}, bands per year: {n_bands}")
+    timer.mark("reference grid determined")
 
-    print("\nBuilding mangrove mask...")
-    mask, rows, cols = build_mangrove_mask(
+    print("\nBuilding mangrove mask and bounding box...")
+    rows, cols, geo_bounds, cropped_shape = build_mangrove_mask(
         external_dir, ref_transform, ref_crs, ref_shape
     )
     n_pixels = len(rows)
-    del mask
+    timer.mark("mangrove mask + bbox computed")
 
     print("\nComputing pixel coordinates...")
-    xs, ys = rasterio.transform.xy(ref_transform, rows, cols)
+    # Coordinates from the CROPPED transform: recompute transform
+    # for the cropped window using geo_bounds + original resolution
+    res_x = ref_transform.a
+    res_y = ref_transform.e
+    left, bottom, right, top = geo_bounds
+    from rasterio.transform import from_origin
+    cropped_transform = from_origin(left, top, res_x, -res_y)
+
+    xs, ys = rasterio.transform.xy(cropped_transform, rows, cols)
     lons, lats = np.array(xs), np.array(ys)
     if ref_crs != "EPSG:4326":
         lons, lats = rio_transform(ref_crs, "EPSG:4326", lons, lats)
         lons, lats = np.array(lons), np.array(lats)
 
-    # Save coords checkpoint (small, needed for final merge)
     coords_path = checkpoint_dir / "zone3_coords.parquet"
     pd.DataFrame({
         "pixel_id": np.arange(n_pixels), "lon": lons, "lat": lats
     }).to_parquet(coords_path, index=False)
+    timer.mark("pixel coordinates computed + saved")
 
-    # ---- Process each year (skips if checkpoint exists) ----
+    # ---- Process each year ----
     for year in range(START_YEAR, END_YEAR + 1):
-        process_year(year, raw_dir, scratch_dir, ref_shape, n_bands,
-                      rows, cols, checkpoint_dir)
+        process_year(year, raw_dir, scratch_dir, cropped_shape, n_bands,
+                      rows, cols, geo_bounds, checkpoint_dir, timer)
 
-    # ---- Final merge: coords + all yearly checkpoints ----
+    # ---- Final merge ----
     print("\nMerging all year checkpoints into final table...")
     final_path = processed_dir / "zone3_pixel_timeseries.parquet"
 
@@ -328,7 +386,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
         chunk = coords_table.slice(start, end - start).to_pandas()
 
         for yf in year_files:
-            yt = pq.read_table(yf, columns=None).slice(start, end - start)
+            yt = pq.read_table(yf).slice(start, end - start)
             ydf = yt.to_pandas().drop(columns=["pixel_id"])
             chunk = pd.concat([chunk.reset_index(drop=True),
                                 ydf.reset_index(drop=True)], axis=1)
@@ -341,6 +399,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
 
     if writer is not None:
         writer.close()
+    timer.mark("final parquet merged + saved")
 
     print(f"\nSaved: {final_path} ({final_path.stat().st_size / 1e6:.1f} MB)")
 
@@ -349,6 +408,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
     print(f"  Total rows (mangrove pixels): {n_rows:,}")
     print(f"  Time series columns: {n_cols}")
     print(f"  Final file: {final_path}")
+    timer.mark("FINISHED")
 
     return {"n_pixels": n_rows, "n_cols": n_cols,
             "parquet_path": str(final_path)}
