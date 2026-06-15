@@ -2,8 +2,11 @@
 MANGLAR — src/pipelines/pipeline3_zone3/merge_and_filter.py
 
 Pipeline 3 - Zone 3 (calibration zone) ingestion.
-Memory-efficient version: processes one band at a time to avoid
-loading full 48-band x full-grid arrays into RAM.
+Disk-backed version: each band's masked values are written to a small
+.npy file on local disk as it's processed, then assembled into the
+final table via a memory-mapped array. RAM never holds more than one
+band's data plus the small per-pixel metadata - independent of how
+many mangrove pixels exist.
 
 Output (written to processed_dir):
   zone3_pixel_timeseries.parquet
@@ -22,6 +25,7 @@ USAGE IN COLAB:
         raw_dir       = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         external_dir  = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         processed_dir = '/content/drive/MyDrive/manglar_processed/zone3',
+        scratch_dir   = '/content/manglar_scratch',
     )
 
 USAGE LOCALLY:
@@ -31,6 +35,7 @@ USAGE LOCALLY:
 import re
 import sys
 import glob
+import shutil
 import warnings
 from pathlib import Path
 
@@ -48,8 +53,8 @@ from src.utils.config_loader import load_config  # noqa: E402
 
 CFG = load_config("base_config.yaml")
 
-START_YEAR = CFG["time"]["start_year"]   # 2017
-END_YEAR   = CFG["time"]["end_year"]     # 2024
+START_YEAR = CFG["time"]["start_year"]
+END_YEAR   = CFG["time"]["end_year"]
 INDICES    = ["NDVI", "EVI", "CIre", "NDWI"]
 NODATA_VAL = -9999.0
 
@@ -58,13 +63,6 @@ NODATA_VAL = -9999.0
 # Tile discovery and mosaicking
 # ============================================================
 def find_tiles(raw_dir, prefix):
-    """Find all GEE export tiles matching a prefix.
-
-    GEE splits large exports into tiles named like:
-        zone3_s2_2018-0000000000-0000000000.tif
-        zone3_s2_2018-0000000000-0000004864.tif
-    A single (untiled) export is matched as 'prefix.tif'.
-    """
     raw_dir = Path(raw_dir)
     tiles = sorted(glob.glob(str(raw_dir / f"{prefix}-*.tif")))
     if not tiles:
@@ -75,19 +73,6 @@ def find_tiles(raw_dir, prefix):
 
 
 def mosaic_tiles(tiles, indexes=None):
-    """Mosaic a list of tile paths into one array.
-
-    Args:
-        tiles:   list of Path objects
-        indexes: optional list of band indexes (1-based) to mosaic.
-                 If None, mosaics ALL bands (memory-heavy — avoid for
-                 multi-band yearly stacks).
-
-    Returns:
-        data       - array of shape (bands, height, width)
-        transform  - rasterio Affine transform of the mosaic
-        crs        - CRS string
-    """
     if not tiles:
         raise FileNotFoundError("No tiles provided to mosaic_tiles().")
 
@@ -108,7 +93,6 @@ def mosaic_tiles(tiles, indexes=None):
 # Band name parsing
 # ============================================================
 def parse_band_name(name):
-    """Parse a band name like 'NDVI_2018_07' -> ('NDVI', 2018, 7)."""
     m = re.match(r"(NDVI|EVI|CIre|NDWI)_(\d{4})_(\d{2})", name)
     if not m:
         return None
@@ -120,10 +104,6 @@ def parse_band_name(name):
 # Reference grid (geometry only, cheap)
 # ============================================================
 def get_reference_grid(raw_dir, start_year):
-    """Determine the mosaic grid (transform, crs, shape, band layout)
-    from the first year's tiles, mosaicking only band 1 to avoid
-    loading the full 48-band stack into memory.
-    """
     tiles = find_tiles(raw_dir, f"zone3_s2_{start_year}")
     if not tiles:
         raise FileNotFoundError(
@@ -139,7 +119,7 @@ def get_reference_grid(raw_dir, start_year):
         s.close()
 
     sample, out_transform, crs = mosaic_tiles(tiles, indexes=[1])
-    shape = sample.shape[1:]  # (height, width)
+    shape = sample.shape[1:]
     del sample
 
     return out_transform, crs, shape, n_bands, band_names
@@ -149,12 +129,6 @@ def get_reference_grid(raw_dir, start_year):
 # Mangrove mask
 # ============================================================
 def build_mangrove_mask(external_dir, transform, crs, shape):
-    """Build the boolean mangrove mask on the reference grid.
-
-    Returns:
-        mask: bool array (height, width)
-        rows, cols: flat pixel indices where mask is True
-    """
     external_dir = Path(external_dir)
     mask_tiles = find_tiles(external_dir, "zone3_gmw_mask")
     if not mask_tiles:
@@ -165,8 +139,8 @@ def build_mangrove_mask(external_dir, transform, crs, shape):
         warnings.warn(
             f"No GMW mask files found in {external_dir} "
             f"(expected 'zone3_gmw_mask*.tif'). "
-            f"Proceeding WITHOUT masking — ALL pixels retained. "
-            f"This may exceed memory for large grids."
+            f"Proceeding WITHOUT masking - ALL pixels retained. "
+            f"This will likely exceed memory for large grids."
         )
         mask = np.ones(shape, dtype=bool)
     else:
@@ -192,30 +166,38 @@ def build_mangrove_mask(external_dir, transform, crs, shape):
     print(f"  Mangrove pixels: {n_pixels:,} of {mask.size:,} "
           f"({100 * n_pixels / mask.size:.2f}%)")
 
-    if n_pixels > 5_000_000:
-        warnings.warn(
-            f"{n_pixels:,} pixels retained — output table will have "
-            f"{n_pixels:,} rows x ~387 columns. Check available memory "
-            f"for the final DataFrame/parquet write."
-        )
     if n_pixels == 0:
         raise ValueError(
             "Mangrove mask matched ZERO pixels. Check that the GMW mask "
             "export covers the same area/CRS as the Sentinel-2 exports."
         )
 
+    n_cols = len(INDICES) * (END_YEAR - START_YEAR + 1) * 12
+    est_gb = n_pixels * n_cols * 4 / 1e9
+    print(f"  Estimated time-series table size: "
+          f"{n_pixels:,} rows x {n_cols} cols "
+          f"~= {est_gb:.2f} GB (float32)")
+    if est_gb > 4:
+        warnings.warn(
+            f"Estimated table size ({est_gb:.2f} GB) is large for "
+            f"Colab free RAM (~12 GB). Using disk-backed memmap to "
+            f"avoid holding this in RAM all at once."
+        )
+
     return mask, rows, cols
 
 
 # ============================================================
-# Main extraction — band-by-band, memory efficient
+# Main extraction - band-by-band, disk-backed
 # ============================================================
-def build_pixel_timeseries(raw_dir, external_dir):
-    """Build the pixel x time series table, processing one band
-    at a time to keep peak memory low.
-    """
+def build_pixel_timeseries(raw_dir, external_dir, scratch_dir):
     raw_dir = Path(raw_dir)
     external_dir = Path(external_dir)
+    scratch_dir = Path(scratch_dir)
+
+    if scratch_dir.exists():
+        shutil.rmtree(scratch_dir)
+    scratch_dir.mkdir(parents=True, exist_ok=True)
 
     print("Determining reference grid from first year...")
     ref_transform, ref_crs, ref_shape, n_bands, _ = \
@@ -227,7 +209,7 @@ def build_pixel_timeseries(raw_dir, external_dir):
         external_dir, ref_transform, ref_crs, ref_shape
     )
     n_pixels = len(rows)
-    del mask  # only rows/cols needed from here on
+    del mask
 
     print("\nComputing pixel coordinates...")
     xs, ys = rasterio.transform.xy(ref_transform, rows, cols)
@@ -236,7 +218,10 @@ def build_pixel_timeseries(raw_dir, external_dir):
         lons, lats = rio_transform(ref_crs, "EPSG:4326", lons, lats)
         lons, lats = np.array(lons), np.array(lats)
 
-    data = {"pixel_id": np.arange(n_pixels), "lon": lons, "lat": lats}
+    np.save(scratch_dir / "lon.npy", lons)
+    np.save(scratch_dir / "lat.npy", lats)
+
+    column_order = []
 
     for year in range(START_YEAR, END_YEAR + 1):
         print(f"\nProcessing year {year}...")
@@ -257,8 +242,7 @@ def build_pixel_timeseries(raw_dir, external_dir):
         if year_n_bands != n_bands:
             raise ValueError(
                 f"Year {year} has {year_n_bands} bands, "
-                f"expected {n_bands} (from {START_YEAR}). "
-                f"Years must share the same export structure."
+                f"expected {n_bands} (from {START_YEAR})."
             )
 
         for band_idx in range(1, n_bands + 1):
@@ -266,7 +250,7 @@ def build_pixel_timeseries(raw_dir, external_dir):
             parsed = parse_band_name(name)
             if parsed is None:
                 warnings.warn(f"Could not parse band '{name}' in year "
-                               f"{year} — skipping")
+                               f"{year} - skipping")
                 continue
             index, b_year, b_month = parsed
 
@@ -277,83 +261,127 @@ def build_pixel_timeseries(raw_dir, external_dir):
             if band_arr.shape != ref_shape:
                 raise ValueError(
                     f"Year {year} band {band_idx} ('{name}') shape "
-                    f"{band_arr.shape} != reference shape {ref_shape}. "
-                    f"Re-export with identical bbox/scale across years."
+                    f"{band_arr.shape} != reference shape {ref_shape}."
                 )
 
             band_arr[band_arr == NODATA_VAL] = np.nan
+            values = band_arr[rows, cols]
+            del band_arr
 
             col_name = f"{index}_{b_year}_{b_month:02d}"
-            data[col_name] = band_arr[rows, cols]
-            del band_arr
+            npy_path = scratch_dir / f"{col_name}.npy"
+            np.save(npy_path, values)
+            column_order.append((col_name, npy_path))
+            del values
 
             if band_idx % 12 == 0:
                 print(f"    ...{band_idx}/{n_bands} bands done "
-                      f"(through {index}_{b_year}_{b_month:02d})")
+                      f"(through {col_name})")
 
-    df = pd.DataFrame(data)
-    return df
+    n_cols = len(column_order)
+    print(f"\nAssembling final table: {n_pixels:,} rows x {n_cols} cols")
+    memmap_path = scratch_dir / "timeseries_memmap.npy"
+    ts_memmap = np.lib.format.open_memmap(
+        memmap_path, mode="w+", dtype=np.float32, shape=(n_pixels, n_cols)
+    )
+    ts_col_names = []
+    for i, (col_name, npy_path) in enumerate(column_order):
+        ts_memmap[:, i] = np.load(npy_path)
+        ts_col_names.append(col_name)
+    ts_memmap.flush()
+
+    pixel_id = np.arange(n_pixels)
+    lons = np.load(scratch_dir / "lon.npy")
+    lats = np.load(scratch_dir / "lat.npy")
+
+    return pixel_id, lons, lats, ts_memmap, ts_col_names, scratch_dir
 
 
 # ============================================================
 # Entry point
 # ============================================================
-def run(raw_dir, external_dir=None, processed_dir=None):
-    """Run the full Zone 3 merge-and-filter pipeline.
-
-    Args:
-        raw_dir:       Folder containing 'zone3_s2_YYYY-*.tif' tiles.
-        external_dir:  Folder containing 'zone3_gmw_mask*.tif'.
-                        Defaults to raw_dir.
-        processed_dir: Output folder for parquet/npz.
-                        Defaults to REPO_ROOT/data/processed/zone3.
-
-    Returns:
-        The resulting pixel x time series DataFrame.
-    """
+def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
     raw_dir = Path(raw_dir)
     external_dir = Path(external_dir) if external_dir else raw_dir
     processed_dir = Path(processed_dir) if processed_dir else (
         REPO_ROOT / "data" / "processed" / "zone3"
     )
+    scratch_dir = Path(scratch_dir) if scratch_dir else (
+        REPO_ROOT / ".scratch" / "zone3"
+    )
     processed_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 60)
     print("MANGLAR - Pipeline 3 (Zone 3) - Merge and Filter")
-    print("(memory-efficient, band-by-band)")
+    print("(disk-backed, band-by-band)")
     print("=" * 60)
     print(f"Years: {START_YEAR}-{END_YEAR}")
     print(f"Raw export dir: {raw_dir}")
     print(f"GMW mask dir:   {external_dir}")
     print(f"Output dir:     {processed_dir}")
+    print(f"Scratch dir:    {scratch_dir}  (local disk)")
 
-    df = build_pixel_timeseries(raw_dir, external_dir)
+    pixel_id, lons, lats, ts_memmap, ts_col_names, scratch_dir = \
+        build_pixel_timeseries(raw_dir, external_dir, scratch_dir)
 
-    parquet_path = processed_dir / "zone3_pixel_timeseries.parquet"
+    n_pixels, n_cols = ts_memmap.shape
+
     npz_path = processed_dir / "zone3_pixel_timeseries.npz"
-
-    df.to_parquet(parquet_path, index=False)
-    print(f"\nSaved: {parquet_path} ({parquet_path.stat().st_size / 1e6:.1f} MB)")
-
-    meta_cols = ["pixel_id", "lon", "lat"]
-    ts_cols = [c for c in df.columns if c not in meta_cols]
+    print(f"\nWriting {npz_path} ...")
     np.savez_compressed(
         npz_path,
-        pixel_id=df["pixel_id"].values,
-        lon=df["lon"].values,
-        lat=df["lat"].values,
-        timeseries=df[ts_cols].values.astype(np.float32),
-        column_names=np.array(ts_cols),
+        pixel_id=pixel_id,
+        lon=lons,
+        lat=lats,
+        timeseries=np.asarray(ts_memmap),
+        column_names=np.array(ts_col_names),
     )
     print(f"Saved: {npz_path} ({npz_path.stat().st_size / 1e6:.1f} MB)")
 
-    print("\nDone. Output summary:")
-    print(f"  Metadata columns: {meta_cols}")
-    print(f"  Time series columns: {len(ts_cols)} "
-          f"({len(INDICES)} indices x {END_YEAR - START_YEAR + 1} years x 12 months)")
-    print(f"  Total rows (mangrove pixels): {len(df):,}")
+    parquet_path = processed_dir / "zone3_pixel_timeseries.parquet"
+    print(f"\nWriting {parquet_path} (chunked)...")
 
-    return df
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    chunk_size = 500_000
+    writer = None
+    for start in range(0, n_pixels, chunk_size):
+        end = min(start + chunk_size, n_pixels)
+        chunk_dict = {
+            "pixel_id": pixel_id[start:end],
+            "lon": lons[start:end],
+            "lat": lats[start:end],
+        }
+        for i, col_name in enumerate(ts_col_names):
+            chunk_dict[col_name] = ts_memmap[start:end, i]
+
+        table = pa.Table.from_pydict(chunk_dict)
+        if writer is None:
+            writer = pq.ParquetWriter(parquet_path, table.schema)
+        writer.write_table(table)
+        print(f"  Wrote rows {start:,}-{end:,}")
+
+    if writer is not None:
+        writer.close()
+    print(f"Saved: {parquet_path} ({parquet_path.stat().st_size / 1e6:.1f} MB)")
+
+    print(f"\nCleaning up scratch dir {scratch_dir} ...")
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+    print("\nDone. Output summary:")
+    print(f"  Metadata columns: ['pixel_id', 'lon', 'lat']")
+    print(f"  Time series columns: {n_cols} "
+          f"({len(INDICES)} indices x {END_YEAR - START_YEAR + 1} years x 12 months)")
+    print(f"  Total rows (mangrove pixels): {n_pixels:,}")
+
+    return {
+        "n_pixels": n_pixels,
+        "n_cols": n_cols,
+        "parquet_path": str(parquet_path),
+        "npz_path": str(npz_path),
+        "column_names": ts_col_names,
+    }
 
 
 if __name__ == "__main__":
@@ -361,4 +389,5 @@ if __name__ == "__main__":
         raw_dir=REPO_ROOT / "data" / "raw" / "gee_exports",
         external_dir=REPO_ROOT / "data" / "external",
         processed_dir=REPO_ROOT / "data" / "processed" / "zone3",
+        scratch_dir=REPO_ROOT / ".scratch" / "zone3",
     )
