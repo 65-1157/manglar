@@ -9,8 +9,7 @@ band's data plus the small per-pixel metadata - independent of how
 many mangrove pixels exist.
 
 Output (written to processed_dir):
-  zone3_pixel_timeseries.parquet
-  zone3_pixel_timeseries.npz
+  zone3_pixel_timeseries.parquet   (chunked write, memory-safe)
 
 USAGE IN COLAB:
     from google.colab import drive
@@ -21,7 +20,7 @@ USAGE IN COLAB:
 
     from src.pipelines.pipeline3_zone3.merge_and_filter import run
 
-    df = run(
+    result = run(
         raw_dir       = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         external_dir  = '/content/drive/MyDrive/MANGLAR_GEE_EXPORTS',
         processed_dir = '/content/drive/MyDrive/manglar_processed/zone3',
@@ -177,12 +176,8 @@ def build_mangrove_mask(external_dir, transform, crs, shape):
     print(f"  Estimated time-series table size: "
           f"{n_pixels:,} rows x {n_cols} cols "
           f"~= {est_gb:.2f} GB (float32)")
-    if est_gb > 4:
-        warnings.warn(
-            f"Estimated table size ({est_gb:.2f} GB) is large for "
-            f"Colab free RAM (~12 GB). Using disk-backed memmap to "
-            f"avoid holding this in RAM all at once."
-        )
+    print(f"  Parquet output is written in 500,000-row chunks - "
+          f"memory-safe regardless of total size.")
 
     return mask, rows, cols
 
@@ -313,7 +308,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
 
     print("=" * 60)
     print("MANGLAR - Pipeline 3 (Zone 3) - Merge and Filter")
-    print("(disk-backed, band-by-band)")
+    print("(disk-backed, band-by-band, parquet-only output)")
     print("=" * 60)
     print(f"Years: {START_YEAR}-{END_YEAR}")
     print(f"Raw export dir: {raw_dir}")
@@ -325,18 +320,6 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
         build_pixel_timeseries(raw_dir, external_dir, scratch_dir)
 
     n_pixels, n_cols = ts_memmap.shape
-
-    npz_path = processed_dir / "zone3_pixel_timeseries.npz"
-    print(f"\nWriting {npz_path} ...")
-    np.savez_compressed(
-        npz_path,
-        pixel_id=pixel_id,
-        lon=lons,
-        lat=lats,
-        timeseries=np.asarray(ts_memmap),
-        column_names=np.array(ts_col_names),
-    )
-    print(f"Saved: {npz_path} ({npz_path.stat().st_size / 1e6:.1f} MB)")
 
     parquet_path = processed_dir / "zone3_pixel_timeseries.parquet"
     print(f"\nWriting {parquet_path} (chunked)...")
@@ -379,7 +362,6 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
         "n_pixels": n_pixels,
         "n_cols": n_cols,
         "parquet_path": str(parquet_path),
-        "npz_path": str(npz_path),
         "column_names": ts_col_names,
     }
 
