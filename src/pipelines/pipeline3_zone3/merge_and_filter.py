@@ -3,16 +3,21 @@ MANGLAR — src/pipelines/pipeline3_zone3/merge_and_filter.py
 
 Pipeline 3 - Zone 3 (calibration zone) ingestion.
 
-KEY OPTIMIZATION: all rio_merge calls are cropped to the bounding
-box of the mangrove mask, not the full export grid. Since mangrove
-covers ~15% of the area but is spatially clustered, this can cut
-per-band merge cost roughly in proportion to the bbox area reduction.
+ARCHITECTURE (v4):
+  Each year has 6 non-overlapping GEE export tiles, each containing
+  all 48 bands. Previous versions called rio_merge once PER BAND
+  (48 merges x 6 tiles = 288 reads/year), paying full merge/resample
+  setup cost 48x redundantly for the same underlying pixels.
 
-Also includes:
-  - Local tile caching per year (kept, small fixed benefit)
-  - Per-year checkpoints to Drive (resumable on crash)
-  - time.time() instrumentation at every milestone, printing both
-    elapsed-since-start and elapsed-since-last-milestone
+  This version reads each tile ONCE (all 48 bands in a single
+  src.read() call), computes that tile's integer pixel offset within
+  the global grid (tiles are axis-aligned, same resolution/CRS - pure
+  offset, no resampling needed), and uses numpy fancy indexing to
+  pull out the masked pixel values for all 48 bands at once.
+  Net: 6 reads/year instead of 288.
+
+  Retains: local tile caching, per-year checkpoints (resumable),
+  and time.time() instrumentation at every milestone.
 
 USAGE IN COLAB:
     from google.colab import drive
@@ -81,7 +86,7 @@ class Timer:
 
 
 # ============================================================
-# Tile discovery and mosaicking
+# Tile discovery
 # ============================================================
 def find_tiles(folder, prefix):
     folder = Path(folder)
@@ -93,18 +98,12 @@ def find_tiles(folder, prefix):
     return [Path(t) for t in tiles]
 
 
-def mosaic_tiles(tiles, indexes=None, bounds=None):
-    """Mosaic tiles, optionally cropped to a (left, bottom, right, top)
-    bounds tuple in the tiles' CRS.
-    """
+def mosaic_tiles(tiles, indexes=None):
+    """Used only for the cheap one-time reference-grid determination."""
     if not tiles:
         raise FileNotFoundError("No tiles provided to mosaic_tiles().")
     srcs = [rasterio.open(t) for t in tiles]
-    kwargs = {}
-    if indexes is not None:
-        kwargs["indexes"] = indexes
-    if bounds is not None:
-        kwargs["bounds"] = bounds
+    kwargs = {"indexes": indexes} if indexes is not None else {}
     mosaic, out_transform = rio_merge(srcs, **kwargs)
     crs = srcs[0].crs.to_string()
     for s in srcs:
@@ -113,7 +112,10 @@ def mosaic_tiles(tiles, indexes=None, bounds=None):
 
 
 def parse_band_name(name):
-    m = re.match(r"(NDVI|EVI|CIre|NDWI)_(\d{4})_(\d{2})", name)
+    """Parse a band name containing 'NDVI_2018_07' etc. Uses search
+    (not match) to tolerate any GEE-added prefixes like '0_NDVI_2018_07'.
+    """
+    m = re.search(r"(NDVI|EVI|CIre|NDWI)_(\d{4})_(\d{2})", name)
     if not m:
         return None
     index, year, month = m.groups()
@@ -121,7 +123,7 @@ def parse_band_name(name):
 
 
 # ============================================================
-# Reference grid (geometry only, cheap — band 1 only)
+# Reference grid (geometry only, one cheap merge of band 1)
 # ============================================================
 def get_reference_grid(raw_dir, start_year):
     tiles = find_tiles(raw_dir, f"zone3_s2_{start_year}")
@@ -135,14 +137,16 @@ def get_reference_grid(raw_dir, start_year):
                    for i in range(n_bands)]
     for s in srcs:
         s.close()
+
     sample, out_transform, crs = mosaic_tiles(tiles, indexes=[1])
-    shape = sample.shape[1:]
+    shape = sample.shape[1:]  # (height, width)
     del sample
+
     return out_transform, crs, shape, n_bands, band_names
 
 
 # ============================================================
-# Mangrove mask + bounding box
+# Mangrove mask
 # ============================================================
 def build_mangrove_mask(external_dir, transform, crs, shape):
     external_dir = Path(external_dir)
@@ -182,46 +186,41 @@ def build_mangrove_mask(external_dir, transform, crs, shape):
     if n_pixels == 0:
         raise ValueError("Mangrove mask matched ZERO pixels.")
 
-    # ---- Bounding box of mangrove pixels, in pixel coords ----
-    row_min, row_max = rows.min(), rows.max()
-    col_min, col_max = cols.min(), cols.max()
-
-    bbox_h = row_max - row_min + 1
-    bbox_w = col_max - col_min + 1
-    full_h, full_w = shape
-    area_frac = (bbox_h * bbox_w) / (full_h * full_w)
-    print(f"  Mangrove bbox (pixels): rows [{row_min}:{row_max}], "
-          f"cols [{col_min}:{col_max}]")
-    print(f"  Bbox area: {bbox_h}x{bbox_w} = "
-          f"{100*area_frac:.1f}% of full grid "
-          f"({full_h}x{full_w})")
-
-    # Convert pixel bbox -> geographic bounds (left, bottom, right, top)
-    # Add a small buffer (2 px) to avoid edge-clipping issues
-    buf = 2
-    row_min_b = max(row_min - buf, 0)
-    row_max_b = min(row_max + buf, full_h - 1)
-    col_min_b = max(col_min - buf, 0)
-    col_max_b = min(col_max + buf, full_w - 1)
-
-    left, top = transform * (col_min_b, row_min_b)
-    right, bottom = transform * (col_max_b + 1, row_max_b + 1)
-    geo_bounds = (left, bottom, right, top)
-    print(f"  Geo bounds for cropped merges: {geo_bounds}")
-
-    # Re-derive rows/cols relative to the CROPPED grid (origin shifted)
-    rows_local = rows - row_min_b
-    cols_local = cols - col_min_b
-    cropped_shape = (row_max_b - row_min_b + 1, col_max_b - col_min_b + 1)
-
-    return rows_local, cols_local, geo_bounds, cropped_shape
+    return rows, cols
 
 
 # ============================================================
-# Per-year processing — local tile cache, cropped merges
+# Tile pixel-offset computation
 # ============================================================
-def process_year(year, raw_dir, local_dir, cropped_shape, n_bands,
-                  rows, cols, geo_bounds, checkpoint_dir, timer):
+def tile_offset(tile_transform, ref_transform, tol=1e-6):
+    """Compute this tile's (row_offset, col_offset) within the global
+    reference grid, assuming identical pixel size/CRS (pure
+    translation, no resampling needed).
+    """
+    px_w = ref_transform.a
+    px_h = ref_transform.e  # negative
+
+    d_col = (tile_transform.c - ref_transform.c) / px_w
+    d_row = (tile_transform.f - ref_transform.f) / px_h
+
+    col_off = round(d_col)
+    row_off = round(d_row)
+
+    if abs(d_col - col_off) > tol or abs(d_row - row_off) > tol:
+        raise ValueError(
+            f"Tile offset is not an integer number of pixels "
+            f"(d_col={d_col}, d_row={d_row}). Tile grid does not align "
+            f"with the reference grid - resampling would be required."
+        )
+    return row_off, col_off
+
+
+# ============================================================
+# Per-year processing — one read per tile, all bands at once
+# ============================================================
+def process_year(year, raw_dir, local_dir, ref_transform, ref_shape,
+                  n_bands, ref_band_names, rows, cols,
+                  checkpoint_dir, timer):
     checkpoint_path = checkpoint_dir / f"zone3_{year}.parquet"
     if checkpoint_path.exists():
         print(f"  Year {year}: checkpoint already exists, skipping.")
@@ -245,47 +244,70 @@ def process_year(year, raw_dir, local_dir, cropped_shape, n_bands,
         local_tiles.append(dst)
     timer.mark(f"year {year}: tile copy done")
 
-    srcs = [rasterio.open(t) for t in local_tiles]
-    band_names = [srcs[0].descriptions[i] or f"band_{i+1}"
-                   for i in range(srcs[0].count)]
-    year_n_bands = srcs[0].count
-    for s in srcs:
-        s.close()
-
-    if year_n_bands != n_bands:
-        raise ValueError(f"Year {year} has {year_n_bands} bands, expected {n_bands}.")
-
-    year_data = {}
-    for band_idx in range(1, n_bands + 1):
-        name = band_names[band_idx - 1]
+    # Column names for this year, derived from the reference band
+    # name pattern (index + month), with this year's number substituted.
+    col_names = []
+    for name in ref_band_names:
         parsed = parse_band_name(name)
         if parsed is None:
-            warnings.warn(f"Could not parse band '{name}' - skipping")
+            col_names.append(None)
             continue
-        index, b_year, b_month = parsed
+        index, _, month = parsed
+        col_names.append(f"{index}_{year}_{month:02d}")
 
-        band_mosaic, _, _ = mosaic_tiles(local_tiles, indexes=[band_idx],
-                                          bounds=geo_bounds)
-        band_arr = band_mosaic[0].astype(np.float32)
-        del band_mosaic
+    n_pixels = len(rows)
+    # Pre-allocate output: NaN until filled by whichever tile covers
+    # each pixel.
+    year_data = {
+        cn: np.full(n_pixels, np.nan, dtype=np.float32)
+        for cn in col_names if cn is not None
+    }
 
-        if band_arr.shape != cropped_shape:
-            raise ValueError(
-                f"Year {year} band {band_idx} cropped shape "
-                f"{band_arr.shape} != expected {cropped_shape}."
+    # ---- Read each tile ONCE, all bands, slice masked pixels ----
+    for tile_idx, tile_path in enumerate(local_tiles, start=1):
+        with rasterio.open(tile_path) as src:
+            if src.count != n_bands:
+                raise ValueError(
+                    f"Year {year} tile {tile_path.name} has {src.count} "
+                    f"bands, expected {n_bands}."
+                )
+
+            row_off, col_off = tile_offset(src.transform, ref_transform)
+            tile_h, tile_w = src.height, src.width
+
+            local_rows = rows - row_off
+            local_cols = cols - col_off
+            in_tile = (
+                (local_rows >= 0) & (local_rows < tile_h) &
+                (local_cols >= 0) & (local_cols < tile_w)
             )
+            n_in_tile = in_tile.sum()
+            if n_in_tile == 0:
+                print(f"    Tile {tile_idx}/{len(local_tiles)} "
+                      f"({tile_path.name}): 0 mangrove pixels, skipping read.")
+                continue
 
-        band_arr[band_arr == NODATA_VAL] = np.nan
-        col_name = f"{index}_{b_year}_{b_month:02d}"
-        year_data[col_name] = band_arr[rows, cols]
-        del band_arr
+            data = src.read().astype(np.float32)  # (n_bands, tile_h, tile_w)
 
-        if band_idx % 12 == 0:
-            timer.mark(f"year {year}: {band_idx}/{n_bands} bands "
-                       f"(through {col_name})")
+        data[data == NODATA_VAL] = np.nan
+
+        lr = local_rows[in_tile]
+        lc = local_cols[in_tile]
+        global_idx = np.where(in_tile)[0]
+
+        for band_idx in range(n_bands):
+            cn = col_names[band_idx]
+            if cn is None:
+                continue
+            values = data[band_idx, lr, lc]  # shape (n_in_tile,)
+            year_data[cn][global_idx] = values
+
+        del data
+        timer.mark(f"year {year}: tile {tile_idx}/{len(local_tiles)} "
+                   f"({n_in_tile:,} px) processed")
 
     df_year = pd.DataFrame(year_data)
-    df_year.insert(0, "pixel_id", np.arange(len(df_year)))
+    df_year.insert(0, "pixel_id", np.arange(n_pixels))
     df_year.to_parquet(checkpoint_path, index=False)
     timer.mark(f"year {year}: checkpoint saved "
                f"({checkpoint_path.stat().st_size/1e6:.1f} MB)")
@@ -315,7 +337,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
 
     print("=" * 60)
     print("MANGLAR - Pipeline 3 (Zone 3) - Merge and Filter")
-    print("(bbox-cropped merges + local cache + checkpoints + timing)")
+    print("(v4: one read per tile, all bands, offset-based indexing)")
     print("=" * 60)
     print(f"Years: {START_YEAR}-{END_YEAR}")
     print(f"Raw export dir: {raw_dir}")
@@ -325,28 +347,18 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
     print(f"Local scratch:  {scratch_dir}")
 
     print("\nDetermining reference grid from first year...")
-    ref_transform, ref_crs, ref_shape, n_bands, _ = \
+    ref_transform, ref_crs, ref_shape, n_bands, ref_band_names = \
         get_reference_grid(raw_dir, START_YEAR)
     print(f"  Grid shape: {ref_shape}, bands per year: {n_bands}")
     timer.mark("reference grid determined")
 
-    print("\nBuilding mangrove mask and bounding box...")
-    rows, cols, geo_bounds, cropped_shape = build_mangrove_mask(
-        external_dir, ref_transform, ref_crs, ref_shape
-    )
+    print("\nBuilding mangrove mask...")
+    rows, cols = build_mangrove_mask(external_dir, ref_transform, ref_crs, ref_shape)
     n_pixels = len(rows)
-    timer.mark("mangrove mask + bbox computed")
+    timer.mark("mangrove mask computed")
 
     print("\nComputing pixel coordinates...")
-    # Coordinates from the CROPPED transform: recompute transform
-    # for the cropped window using geo_bounds + original resolution
-    res_x = ref_transform.a
-    res_y = ref_transform.e
-    left, bottom, right, top = geo_bounds
-    from rasterio.transform import from_origin
-    cropped_transform = from_origin(left, top, res_x, -res_y)
-
-    xs, ys = rasterio.transform.xy(cropped_transform, rows, cols)
+    xs, ys = rasterio.transform.xy(ref_transform, rows, cols)
     lons, lats = np.array(xs), np.array(ys)
     if ref_crs != "EPSG:4326":
         lons, lats = rio_transform(ref_crs, "EPSG:4326", lons, lats)
@@ -360,8 +372,9 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
 
     # ---- Process each year ----
     for year in range(START_YEAR, END_YEAR + 1):
-        process_year(year, raw_dir, scratch_dir, cropped_shape, n_bands,
-                      rows, cols, geo_bounds, checkpoint_dir, timer)
+        process_year(year, raw_dir, scratch_dir, ref_transform, ref_shape,
+                      n_bands, ref_band_names, rows, cols,
+                      checkpoint_dir, timer)
 
     # ---- Final merge ----
     print("\nMerging all year checkpoints into final table...")
@@ -403,7 +416,7 @@ def run(raw_dir, external_dir=None, processed_dir=None, scratch_dir=None):
 
     print(f"\nSaved: {final_path} ({final_path.stat().st_size / 1e6:.1f} MB)")
 
-    n_cols = sum(48 for _ in year_files)
+    n_cols = 48 * len(year_files)
     print("\nDone. Output summary:")
     print(f"  Total rows (mangrove pixels): {n_rows:,}")
     print(f"  Time series columns: {n_cols}")
