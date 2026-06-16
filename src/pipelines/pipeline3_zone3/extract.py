@@ -1,4 +1,4 @@
-﻿"""MANGLAR — src/pipelines/pipeline2_zone2/extract.py"""
+﻿"""MANGLAR — src/pipelines/pipeline3_zone3/extract.py"""
 import sys
 from pathlib import Path
 
@@ -9,7 +9,7 @@ from src.utils.config_loader import load_config
 from src.utils.pixel_extraction import Timer, extract_pixel_timeseries, merge_checkpoints
 
 CFG = load_config("base_config.yaml")
-ZONE, PREFIX, MASK_PREFIX = "zone2", "zone2_s2", "zone2_gmw_mask"
+ZONE, PREFIX, MASK_PREFIX = "zone3", "zone3_s2", "zone3_gmw_mask"
 INDICES = ["NDVI", "EVI", "CIre", "NDWI"]
 START_YEAR, END_YEAR = CFG["time"]["start_year"], CFG["time"]["end_year"]
 
