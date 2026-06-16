@@ -1,12 +1,17 @@
 ﻿"""
-MANGLAR — src/utils/pixel_extraction.py
+MANGLAR — src/utils/pixel_extraction.py  (v6)
 
 Shared, zone-agnostic pixel-timeseries extraction pipeline.
 
-Generalizes the v5 logic proven on Zone 3 (windowed reads direct from
-Drive, no local copy, bounded memory via row-blocks + gc.collect(),
-per-year checkpoints for crash-resumability, time.time() instrumentation
-at every milestone).
+v6 CHANGE vs v5: process_year() now spills each tile's contribution
+to local disk immediately after reading it, instead of holding one
+persistent (n_pixels_TOTAL_ZONE x 48) buffer in RAM across all tiles
+for the whole year. This fixes an OOM found on Zone 1 (28.3M mangrove
+pixels x 48 cols x 4 bytes = 5.44 GB held in RAM for the entire
+year's tile-reading loop, on top of block reads, exceeding Colab's
+12.7 GB ceiling). Peak RAM during tile reading is now bounded by
+per-tile pixel count, not total zone pixel count - safe regardless
+of zone size.
 
 Used by:
   src/pipelines/pipeline1_zone1/extract.py  (zone="zone1")
@@ -171,7 +176,17 @@ def tile_offset(tile_transform, ref_transform, tol=1e-6):
 
 def process_year(year, raw_dir, prefix, ref_transform, n_bands,
                   ref_band_names, parse_band_name, rows, cols,
-                  checkpoint_dir, zone, timer):
+                  checkpoint_dir, zone, timer, scratch_dir=None):
+    """v6: tile-level disk spill. Peak RAM during tile reading is
+    bounded by per-tile pixel count, not total zone pixel count.
+
+    Args:
+        scratch_dir: local (non-Drive) scratch folder for per-tile
+                     .npy spill files. Defaults to checkpoint_dir
+                     if not given (works, but prefer a LOCAL Colab
+                     path like '/content/manglar_scratch' for speed -
+                     avoids Drive-FUSE write overhead per tile).
+    """
     checkpoint_path = checkpoint_dir / f"{zone}_{year}.parquet"
     if checkpoint_path.exists():
         print(f"  [{zone}] Year {year}: checkpoint exists, skipping.")
@@ -196,11 +211,13 @@ def process_year(year, raw_dir, prefix, ref_transform, n_bands,
         index, _, month = parsed
         col_names.append(f"{index}_{year}_{month:02d}")
 
-    n_pixels = len(rows)
-    year_data = {
-        cn: np.full(n_pixels, np.nan, dtype=np.float32)
-        for cn in col_names if cn is not None
-    }
+    n_pixels_total = len(rows)
+
+    spill_dir = Path(scratch_dir) if scratch_dir else checkpoint_dir
+    year_spill_dir = spill_dir / f"_spill_{zone}_{year}"
+    year_spill_dir.mkdir(parents=True, exist_ok=True)
+
+    tile_spill_files = []
 
     for tile_idx, tile_path in enumerate(tiles, start=1):
         with rasterio.open(tile_path) as src:
@@ -229,6 +246,8 @@ def process_year(year, raw_dir, prefix, ref_transform, n_bands,
             lr = local_rows[in_tile]
             lc = local_cols[in_tile]
 
+            tile_values = np.full((n_in_tile, n_bands), np.nan, dtype=np.float32)
+
             n_blocks = (tile_h + BLOCK_ROWS - 1) // BLOCK_ROWS
             for block_start in range(0, tile_h, BLOCK_ROWS):
                 block_h = min(BLOCK_ROWS, tile_h - block_start)
@@ -243,37 +262,67 @@ def process_year(year, raw_dir, prefix, ref_transform, n_bands,
 
                 block_lr = lr[in_block] - block_start
                 block_lc = lc[in_block]
-                block_global_idx = global_idx[in_block]
+                block_local_idx = np.where(in_block)[0]
 
                 for band_idx in range(n_bands):
-                    cn = col_names[band_idx]
-                    if cn is None:
+                    if col_names[band_idx] is None:
                         continue
-                    year_data[cn][block_global_idx] = \
+                    tile_values[block_local_idx, band_idx] = \
                         block_data[band_idx, block_lr, block_lc]
 
                 del block_data
                 gc.collect()
 
+            idx_path = year_spill_dir / f"tile{tile_idx}_idx.npy"
+            val_path = year_spill_dir / f"tile{tile_idx}_val.npy"
+            np.save(idx_path, global_idx)
+            np.save(val_path, tile_values)
+            tile_spill_files.append((idx_path, val_path))
+
+            del tile_values, global_idx, lr, lc, local_rows, local_cols, in_tile
+            gc.collect()
+
             print(f"    Tile {tile_idx}/{len(tiles)} "
                   f"({tile_path.name}): {n_in_tile:,} px, "
-                  f"{n_blocks} row-blocks done")
+                  f"{n_blocks} row-blocks done, spilled to disk")
 
         timer.mark(f"{zone} year {year}: tile {tile_idx}/{len(tiles)} done")
 
-    df_year = pd.DataFrame(year_data)
-    df_year.insert(0, "pixel_id", np.arange(n_pixels))
+    print(f"  [{zone}] Merging {len(tile_spill_files)} tile spill "
+          f"files for year {year}...")
+    year_array = np.full((n_pixels_total, n_bands), np.nan, dtype=np.float32)
+
+    for idx_path, val_path in tile_spill_files:
+        global_idx = np.load(idx_path)
+        tile_values = np.load(val_path)
+        year_array[global_idx, :] = tile_values
+        del global_idx, tile_values
+        idx_path.unlink()
+        val_path.unlink()
+
+    year_spill_dir.rmdir()
+    gc.collect()
+
+    valid_col_names = [cn for cn in col_names if cn is not None]
+    valid_col_idx = [i for i, cn in enumerate(col_names) if cn is not None]
+
+    df_year = pd.DataFrame(
+        year_array[:, valid_col_idx], columns=valid_col_names
+    )
+    df_year.insert(0, "pixel_id", np.arange(n_pixels_total))
     df_year.to_parquet(checkpoint_path, index=False)
+
+    del year_array, df_year
+    gc.collect()
+
     timer.mark(f"{zone} year {year}: checkpoint saved "
                f"({checkpoint_path.stat().st_size/1e6:.1f} MB)")
-
-    del year_data, df_year
-    gc.collect()
 
 
 def extract_pixel_timeseries(zone, raw_dir, external_dir, processed_dir,
                               prefix, mask_prefix, indices,
-                              start_year, end_year, timer=None):
+                              start_year, end_year, timer=None,
+                              scratch_dir=None):
     if timer is None:
         timer = Timer()
 
@@ -287,13 +336,15 @@ def extract_pixel_timeseries(zone, raw_dir, external_dir, processed_dir,
 
     print("=" * 60)
     print(f"MANGLAR - [{zone}] Pixel time series extraction")
-    print("(windowed reads direct from Drive, bounded memory)")
+    print("(v6: windowed reads + tile-level disk spill, bounded memory)")
     print("=" * 60)
     print(f"Years: {start_year}-{end_year}")
     print(f"Raw export dir: {raw_dir}")
     print(f"Mask dir:       {external_dir}")
     print(f"Output dir:     {processed_dir}")
     print(f"Block size:     {BLOCK_ROWS} rows/read")
+    if scratch_dir:
+        print(f"Scratch dir:    {scratch_dir} (local spill)")
 
     print(f"\n[{zone}] Determining reference grid from {start_year}...")
     ref_transform, ref_crs, ref_shape, n_bands, ref_band_names = \
@@ -326,7 +377,7 @@ def extract_pixel_timeseries(zone, raw_dir, external_dir, processed_dir,
     for year in range(start_year, end_year + 1):
         process_year(year, raw_dir, prefix, ref_transform, n_bands,
                       ref_band_names, parse_band_name, rows, cols,
-                      checkpoint_dir, zone, timer)
+                      checkpoint_dir, zone, timer, scratch_dir=scratch_dir)
 
     year_files = [checkpoint_dir / f"{zone}_{y}.parquet"
                    for y in range(start_year, end_year + 1)]
