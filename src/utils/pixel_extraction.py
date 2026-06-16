@@ -1,17 +1,19 @@
-﻿"""
-MANGLAR — src/utils/pixel_extraction.py  (v6)
+"""
+MANGLAR — src/utils/pixel_extraction.py  (v7)
 
 Shared, zone-agnostic pixel-timeseries extraction pipeline.
 
-v6 CHANGE vs v5: process_year() now spills each tile's contribution
-to local disk immediately after reading it, instead of holding one
-persistent (n_pixels_TOTAL_ZONE x 48) buffer in RAM across all tiles
-for the whole year. This fixes an OOM found on Zone 1 (28.3M mangrove
-pixels x 48 cols x 4 bytes = 5.44 GB held in RAM for the entire
-year's tile-reading loop, on top of block reads, exceeding Colab's
-12.7 GB ceiling). Peak RAM during tile reading is now bounded by
-per-tile pixel count, not total zone pixel count - safe regardless
-of zone size.
+v7 CHANGE vs v6: the year-level merge step (after all tiles for a
+year are spilled to disk) no longer allocates a single full-zone
+array. v6 still did:
+    year_array = np.full((n_pixels_total, n_bands), ...)
+which for Zone 1 (28,349,239 pixels x 48 bands x 4 bytes = 5.44 GB)
+silently OOM-killed the process at merge time (no Python traceback -
+OS-level kill). v7 writes the year's parquet checkpoint in ROW-CHUNKS
+(YEAR_MERGE_CHUNK_SIZE = 2,000,000 rows), re-reading the small tile
+spill files once per chunk. Peak RAM during merge is now
+chunk_size x n_bands x 4 bytes (~384 MB), independent of total zone
+pixel count.
 
 Used by:
   src/pipelines/pipeline1_zone1/extract.py  (zone="zone1")
@@ -36,6 +38,7 @@ from rasterio.warp import transform as rio_transform, reproject, Resampling
 
 NODATA_VAL = -9999.0
 BLOCK_ROWS = 200
+YEAR_MERGE_CHUNK_SIZE = 2_000_000  # rows per chunk during year-level merge
 
 
 class Timer:
@@ -174,18 +177,73 @@ def tile_offset(tile_transform, ref_transform, tol=1e-6):
     return row_off, col_off
 
 
+def merge_tile_spills_to_parquet(tile_spill_files, n_pixels_total, n_bands,
+                                   valid_col_names, valid_col_idx,
+                                   checkpoint_path,
+                                   chunk_size=YEAR_MERGE_CHUNK_SIZE):
+    """Write a year's checkpoint parquet in row-chunks, never holding
+    a full (n_pixels_total x n_bands) array in memory at once.
+
+    For each chunk of rows [start:end), loads each tile spill file's
+    (global_idx, values) and writes whichever rows of THIS CHUNK that
+    tile contributes to. Re-reads the (small) spill files once per
+    chunk - trades a little redundant disk I/O for bounded RAM.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    print(f"  Merging {len(tile_spill_files)} tile spill files "
+          f"({chunk_size:,} rows/chunk)...")
+
+    writer = None
+    for chunk_start in range(0, n_pixels_total, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, n_pixels_total)
+        chunk_n = chunk_end - chunk_start
+
+        chunk_array = np.full((chunk_n, n_bands), np.nan, dtype=np.float32)
+
+        for idx_path, val_path in tile_spill_files:
+            global_idx = np.load(idx_path)
+            in_chunk = (global_idx >= chunk_start) & (global_idx < chunk_end)
+            if not in_chunk.any():
+                del global_idx, in_chunk
+                continue
+
+            tile_values = np.load(val_path)
+            local_idx_in_chunk = global_idx[in_chunk] - chunk_start
+            chunk_array[local_idx_in_chunk, :] = tile_values[in_chunk, :]
+
+            del global_idx, tile_values, in_chunk, local_idx_in_chunk
+
+        df_chunk = pd.DataFrame(
+            chunk_array[:, valid_col_idx], columns=valid_col_names
+        )
+        df_chunk.insert(0, "pixel_id", np.arange(chunk_start, chunk_end))
+
+        table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(checkpoint_path, table.schema)
+        writer.write_table(table)
+
+        print(f"    Chunk rows {chunk_start:,}-{chunk_end:,} written")
+
+        del chunk_array, df_chunk, table
+        gc.collect()
+
+    if writer is not None:
+        writer.close()
+
+    for idx_path, val_path in tile_spill_files:
+        idx_path.unlink(missing_ok=True)
+        val_path.unlink(missing_ok=True)
+
+
 def process_year(year, raw_dir, prefix, ref_transform, n_bands,
                   ref_band_names, parse_band_name, rows, cols,
                   checkpoint_dir, zone, timer, scratch_dir=None):
-    """v6: tile-level disk spill. Peak RAM during tile reading is
-    bounded by per-tile pixel count, not total zone pixel count.
-
-    Args:
-        scratch_dir: local (non-Drive) scratch folder for per-tile
-                     .npy spill files. Defaults to checkpoint_dir
-                     if not given (works, but prefer a LOCAL Colab
-                     path like '/content/manglar_scratch' for speed -
-                     avoids Drive-FUSE write overhead per tile).
+    """v7: tile-level disk spill + chunked year-merge. Peak RAM during
+    BOTH tile reading and year-merge is bounded by a fixed chunk/tile
+    size, never by total zone pixel count.
     """
     checkpoint_path = checkpoint_dir / f"{zone}_{year}.parquet"
     if checkpoint_path.exists():
@@ -288,31 +346,16 @@ def process_year(year, raw_dir, prefix, ref_transform, n_bands,
 
         timer.mark(f"{zone} year {year}: tile {tile_idx}/{len(tiles)} done")
 
-    print(f"  [{zone}] Merging {len(tile_spill_files)} tile spill "
-          f"files for year {year}...")
-    year_array = np.full((n_pixels_total, n_bands), np.nan, dtype=np.float32)
-
-    for idx_path, val_path in tile_spill_files:
-        global_idx = np.load(idx_path)
-        tile_values = np.load(val_path)
-        year_array[global_idx, :] = tile_values
-        del global_idx, tile_values
-        idx_path.unlink()
-        val_path.unlink()
-
-    year_spill_dir.rmdir()
-    gc.collect()
-
+    # ---- v7: chunked merge, never allocates full-zone array ----
     valid_col_names = [cn for cn in col_names if cn is not None]
     valid_col_idx = [i for i, cn in enumerate(col_names) if cn is not None]
 
-    df_year = pd.DataFrame(
-        year_array[:, valid_col_idx], columns=valid_col_names
+    merge_tile_spills_to_parquet(
+        tile_spill_files, n_pixels_total, n_bands,
+        valid_col_names, valid_col_idx, checkpoint_path
     )
-    df_year.insert(0, "pixel_id", np.arange(n_pixels_total))
-    df_year.to_parquet(checkpoint_path, index=False)
 
-    del year_array, df_year
+    year_spill_dir.rmdir()
     gc.collect()
 
     timer.mark(f"{zone} year {year}: checkpoint saved "
@@ -336,13 +379,14 @@ def extract_pixel_timeseries(zone, raw_dir, external_dir, processed_dir,
 
     print("=" * 60)
     print(f"MANGLAR - [{zone}] Pixel time series extraction")
-    print("(v6: windowed reads + tile-level disk spill, bounded memory)")
+    print("(v7: tile spill + chunked year-merge, bounded memory)")
     print("=" * 60)
     print(f"Years: {start_year}-{end_year}")
     print(f"Raw export dir: {raw_dir}")
     print(f"Mask dir:       {external_dir}")
     print(f"Output dir:     {processed_dir}")
     print(f"Block size:     {BLOCK_ROWS} rows/read")
+    print(f"Year-merge chunk size: {YEAR_MERGE_CHUNK_SIZE:,} rows")
     if scratch_dir:
         print(f"Scratch dir:    {scratch_dir} (local spill)")
 
