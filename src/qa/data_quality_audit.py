@@ -1,14 +1,27 @@
-﻿"""
-MANGLAR — src/qa/data_quality_audit.py
+"""
+MANGLAR — src/qa/data_quality_audit.py  (v2)
 
 Standardized data-quality audit, applied identically to all three
-zones (zone1, zone2, zone3). Produces:
+zones (zone1, zone2, zone3).
 
-  1. A structured JSON summary per zone (machine-readable, for
-     building paper tables programmatically and for audit trail).
-  2. A histogram figure per zone (dpi=600, publication-ready).
-  3. A combined 3-panel comparison figure across all zones (dpi=600).
-  4. A markdown summary table comparing all zones side by side.
+v2 FIX vs v1: _load_ndvi_sample() previously read only the FIRST
+row-group batch of the parquet file. Because pixel order follows the
+mask's row-major scan order (np.where(mask)), this is a NARROW
+GEOGRAPHIC SLICE, not a representative spatial sample - confirmed on
+Zone 1, where the first 5000 rows (the bbox's northwest corner,
+likely open water/tidal flat) showed 46.6% negative NDVI, while a
+proper multi-row-group sample across the full spatial extent showed
+only 4.1% negative. v2 samples evenly-spaced ROW GROUPS across the
+whole file (default 5), which span the full geographic extent of the
+zone, then concatenates them - this is what the manual diagnostic
+that caught the v1 bug already validated.
+
+Produces (per zone):
+  1. A structured JSON summary (machine-readable, audit trail).
+  2. A histogram figure (dpi=600, publication-ready).
+Produces (cross-zone):
+  3. A combined N-panel comparison figure (dpi=600).
+  4. A markdown summary table.
 
 USAGE IN COLAB:
     import sys
@@ -16,10 +29,16 @@ USAGE IN COLAB:
 
     from src.qa.data_quality_audit import audit_zone, compare_zones
 
-    s3 = audit_zone('zone3', '.../zone3_pixel_timeseries.parquet', qa_dir)
     s1 = audit_zone('zone1', '.../zone1_pixel_timeseries.parquet', qa_dir)
     s2 = audit_zone('zone2', '.../zone2_pixel_timeseries.parquet', qa_dir)
+    s3 = audit_zone('zone3', '.../zone3_pixel_timeseries.parquet', qa_dir)
     compare_zones([s1, s2, s3], qa_dir)
+
+IMPORTANT: zone1, zone2, and zone3's PREVIOUSLY SAVED JSON summaries
+(from the v1 script) should be treated as UNRELIABLE for zone1
+specifically (confirmed wrong) and unverified for zone2/zone3 (likely
+fine since their first-row-group happened to be representative, but
+not confirmed) until re-run with this v2 script.
 """
 
 import json
@@ -34,7 +53,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 DPI = 600
-SAMPLE_SIZE = 5000
+N_ROW_GROUPS_SAMPLED = 5    # spatially-distributed row groups per zone
 RANDOM_SEED = 42
 NDVI_LOW_THRESHOLD = 0.3
 HIST_BINS = 100
@@ -46,31 +65,64 @@ ZONE_COLORS = {
     "zone3": "#7f7f7f",
 }
 ZONE_LABELS = {
-    "zone1": "Zone 1 - Primary (Reentrancias, fishing pressure)",
-    "zone2": "Zone 2 - Contrast (Itapecuru estuary, riverine pressure)",
-    "zone3": "Zone 3 - Calibration (near-pristine reference)",
+    "zone1": "Zone 1 — Primary (Reentrâncias, fishing pressure)",
+    "zone2": "Zone 2 — Contrast (Itapecuru estuary, riverine pressure)",
+    "zone3": "Zone 3 — Calibration (near-pristine reference)",
 }
 
 
-def _load_ndvi_sample(parquet_path, sample_size=SAMPLE_SIZE, seed=RANDOM_SEED):
+def _load_ndvi_sample(parquet_path, n_row_groups=N_ROW_GROUPS_SAMPLED):
+    """Load NDVI columns + metadata from SEVERAL spatially-distributed
+    row groups, not just the first one.
+
+    Row groups are evenly spaced across the file (via np.linspace),
+    which - given pixel order follows the mask's row-major scan order
+    - corresponds to evenly-spaced GEOGRAPHIC slices across the zone's
+    full extent. This avoids the v1 bug where a single corner of the
+    bbox could dominate the sample.
+    """
     pf = pq.ParquetFile(parquet_path)
     all_cols = pf.schema_arrow.names
     ndvi_cols = sorted([c for c in all_cols if c.startswith("NDVI_")])
     needed_cols = ["pixel_id", "lon", "lat"] + ndvi_cols
 
-    batch = next(pf.iter_batches(batch_size=sample_size, columns=needed_cols))
-    df = batch.to_pandas()
+    total_row_groups = pf.num_row_groups
+    n_to_sample = min(n_row_groups, total_row_groups)
+    rg_indices = np.linspace(0, total_row_groups - 1, n_to_sample, dtype=int)
+    rg_indices = sorted(set(rg_indices.tolist()))  # dedupe if file is small
 
-    return df, ndvi_cols, pf.metadata.num_rows, len(all_cols)
+    dfs = []
+    for rg_idx in rg_indices:
+        table = pf.read_row_group(rg_idx, columns=needed_cols)
+        dfs.append(table.to_pandas())
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    geo_extent = {
+        "lon_min": float(df["lon"].min()), "lon_max": float(df["lon"].max()),
+        "lat_min": float(df["lat"].min()), "lat_max": float(df["lat"].max()),
+    }
+
+    return df, ndvi_cols, pf.metadata.num_rows, len(all_cols), rg_indices, geo_extent
 
 
-def audit_zone(zone, parquet_path, output_dir, ndvi_low_threshold=NDVI_LOW_THRESHOLD):
+def audit_zone(zone, parquet_path, output_dir, ndvi_low_threshold=NDVI_LOW_THRESHOLD,
+               n_row_groups=N_ROW_GROUPS_SAMPLED):
+    """Run the standardized data-quality audit for one zone, sampling
+    across multiple spatially-distributed row groups (v2 fix).
+    """
     t0 = time.time()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[{zone}] Loading NDVI sample from {parquet_path} ...")
-    df, ndvi_cols, total_rows, total_cols = _load_ndvi_sample(parquet_path)
+    df, ndvi_cols, total_rows, total_cols, rg_indices, geo_extent = \
+        _load_ndvi_sample(parquet_path, n_row_groups)
+
+    print(f"  Sampled {len(rg_indices)} row group(s): {rg_indices}")
+    print(f"  Geographic extent of sample: "
+          f"lon [{geo_extent['lon_min']:.3f}, {geo_extent['lon_max']:.3f}], "
+          f"lat [{geo_extent['lat_min']:.3f}, {geo_extent['lat_max']:.3f}]")
 
     ndvi_vals = df[ndvi_cols].values.astype(float)
     nan_mask = np.isnan(ndvi_vals)
@@ -81,10 +133,12 @@ def audit_zone(zone, parquet_path, output_dir, ndvi_low_threshold=NDVI_LOW_THRES
         "zone": zone,
         "parquet_path": str(parquet_path),
         "audit_timestamp_utc": pd.Timestamp.utcnow().isoformat(),
+        "audit_script_version": "v2_multi_row_group",
         "total_rows_full_dataset": int(total_rows),
         "total_cols_full_dataset": int(total_cols),
         "sample_size_rows": int(len(df)),
-        "sample_random_seed": RANDOM_SEED,
+        "sample_row_groups": [int(i) for i in rg_indices],
+        "sample_geo_extent": geo_extent,
         "n_ndvi_columns": len(ndvi_cols),
         "nan_fraction_mean": float(nan_frac_per_pixel.mean()),
         "nan_fraction_median": float(np.median(nan_frac_per_pixel)),
@@ -125,8 +179,8 @@ def audit_zone(zone, parquet_path, output_dir, ndvi_low_threshold=NDVI_LOW_THRES
     ax.set_xlabel("NDVI")
     ax.set_ylabel("Pixel-month count (sample)")
     ax.set_title(f"{label}\nValid NDVI distribution "
-                 f"(n={summary['sample_size_rows']:,} sampled pixels, "
-                 f"NaN={summary['nan_fraction_mean']:.1%})")
+                 f"(n={summary['sample_size_rows']:,} sampled pixels across "
+                 f"{len(rg_indices)} row groups, NaN={summary['nan_fraction_mean']:.1%})")
     ax.legend(loc="upper left", fontsize=9)
     fig.tight_layout()
 
@@ -142,7 +196,10 @@ def audit_zone(zone, parquet_path, output_dir, ndvi_low_threshold=NDVI_LOW_THRES
     return summary
 
 
-def compare_zones(summaries, output_dir):
+def compare_zones(summaries, output_dir, n_row_groups=N_ROW_GROUPS_SAMPLED):
+    """Build a cross-zone comparison figure and markdown table from a
+    list of summary dicts produced by audit_zone().
+    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -153,7 +210,7 @@ def compare_zones(summaries, output_dir):
 
     for ax, s in zip(axes, summaries):
         zone = s["zone"]
-        df, ndvi_cols, _, _ = _load_ndvi_sample(s["parquet_path"])
+        df, ndvi_cols, _, _, _, _ = _load_ndvi_sample(s["parquet_path"], n_row_groups)
         ndvi_vals = df[ndvi_cols].values.astype(float)
         valid = ndvi_vals[~np.isnan(ndvi_vals)]
 
@@ -169,7 +226,7 @@ def compare_zones(summaries, output_dir):
 
     axes[0].set_ylabel("Pixel-month count (sample)")
     fig.suptitle("Cross-zone NDVI distribution comparison "
-                 "(standardized audit, identical binning)", fontsize=12)
+                 "(standardized audit, multi-row-group sampling)", fontsize=12)
     fig.tight_layout()
 
     combined_fig_path = output_dir / "cross_zone_ndvi_comparison.png"
@@ -193,7 +250,7 @@ def compare_zones(summaries, output_dir):
     table_df = pd.DataFrame(rows)
     table_path = output_dir / "cross_zone_quality_table.md"
     with open(table_path, "w") as f:
-        f.write("# MANGLAR - Cross-zone data quality audit\n\n")
+        f.write("# MANGLAR — Cross-zone data quality audit (v2, multi-row-group sampling)\n\n")
         f.write(f"Generated: {pd.Timestamp.utcnow().isoformat()}\n\n")
         f.write(table_df.to_markdown(index=False))
         f.write("\n")
